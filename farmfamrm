@@ -43,34 +43,18 @@ local remotes = ReplicatedStorage:WaitForChild("Remotes", 5)
 local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 
 -- ============================== SETTINGS ==============================
-local TARGET_SPEED       = 22     -- studs per second
+local TARGET_SPEED       = 23     -- studs per second, and 23 is the ceiling:
+                                  -- it keeps the flight smooth and readable
 local MAX_DIST           = 1000   -- radius of the sphere the search covers
-local COLLECT_RADIUS     = 2      -- stand on the coin once this close
+local COLLECT_RADIUS     = 2.8     -- the coin counts as reached this close, which
+                                  -- is all it takes: the character flies over it
+                                  -- and the coin is taken on the way past
 local RETARGET_BIAS      = 0.5    -- a coin must be this much closer to steal the
                                   -- target, so two equal coins cannot make the
                                   -- direction flip-flop every frame
-local MAX_FRAME_DT       = 0.1    -- a frame longer than this is clamped, so a
-                                  -- freeze cannot become one huge step
-local RESYNC_DISTANCE    = 10     -- beyond this the game moved us (round change)
-                                  -- and we follow instead of pulling back
-local SNAP_BACK_DISTANCE = 200    -- only snap back to the last good spot if it
-                                  -- is close: a long teleport is what a server
-                                  -- refuses
-local RESET_DELAY        = 5      -- idle this long with no coin left, then reset
-local ROUND_START_DELAY  = 0
-local PENDING_TIMEOUT    = 0.1    -- how long to wait for the game to confirm a
-                                  -- coin we just touched
-local RETRY_DELAY        = 4      -- a coin that did not confirm is left alone
-                                  -- this long, then it is a target again
+local RESET_DELAY        = 30     -- idle this long with no coin left, then reset
 local ANTI_FLING_MAX_SPEED = 30   -- above this a velocity is treated as a fling
                                   -- and damped; well clear of TARGET_SPEED
-
--- sanity bounds for the character's own position. Deliberately enormous: this
--- catches a physics blow-up, it is not meant to police ordinary places (a lobby
--- can legitimately sit below the map).
-local MIN_Y          = -2000
-local MAX_Y          = 20000
-local MAX_ABS_COORD  = 100000
 
 -- server hop
 local HOP_ENABLED          = true
@@ -105,10 +89,7 @@ local showErrors       = false   -- was any frame error caught
 -- coins
 local activeCoins      = {}
 local blacklistedCoins = {}
-local coinCooldown     = {}      -- coin -> os.clock() it becomes a target again
 local currentTarget    = nil
-local pendingCoin      = nil     -- touched, waiting for the game to confirm
-local pendingSince     = 0
 local noCoinsStartTime = nil
 local hasCollectedThisLife = false
 local coinsCollected   = 0
@@ -156,16 +137,6 @@ local function isFiniteVector(v)
     return isFiniteNumber(v.X) and isFiniteNumber(v.Y) and isFiniteNumber(v.Z)
 end
 
--- a position that has gone to nonsense: NaN, infinity, or coordinates far
--- outside anything a map could contain
-local function isPositionValid(pos)
-    return isFiniteVector(pos)
-        and pos.Y > MIN_Y
-        and pos.Y < MAX_Y
-        and math.abs(pos.X) < MAX_ABS_COORD
-        and math.abs(pos.Z) < MAX_ABS_COORD
-end
-
 -- the orientation to keep when the character is moved. Only read back while the
 -- CFrame is itself sane.
 local function currentRotation()
@@ -206,23 +177,13 @@ local function holdPosition()
     if not rootPart or not rootPart.Parent then return end
     virtualPos = nil
 
-    local rootPos = rootPart.Position
-    if not isFiniteVector(rootPos) then return end
-
-    -- if we are no longer where we left the character, the game moved it (round
-    -- change), so accept the new spot instead of yanking it back
-    if heldCFrame and (heldCFrame.Position - rootPos).Magnitude > RESYNC_DISTANCE then
-        heldCFrame = nil
-    end
-
     if not heldCFrame then heldCFrame = rootPart.CFrame end
     rootPart.CFrame = heldCFrame
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
 end
 
--- one frame of travel toward a position, written directly. `dt` is clamped so a
--- freeze cannot turn into a single huge jump.
+-- one frame of travel toward a position, written directly.
 local function stepTowards(targetPos, dt)
     if not rootPart or not rootPart.Parent then return end
 
@@ -232,8 +193,8 @@ local function stepTowards(targetPos, dt)
     -- an absolute position, not "current position + one step": with a relative
     -- move gravity adds up frame after frame and the character sinks through the
     -- map. Writing the intended position each frame wipes that drift out.
-    if not virtualPos or not isFiniteVector(virtualPos)
-        or (rootPos - virtualPos).Magnitude > RESYNC_DISTANCE then
+    -- virtualPos is reset at every round start, so it can never be stale.
+    if not virtualPos or not isFiniteVector(virtualPos) then
         virtualPos = rootPos
     end
 
@@ -243,11 +204,12 @@ local function stepTowards(targetPos, dt)
     local distance = direction.Magnitude
     if distance < 0.001 then return end
 
+    -- never overshoot: the step stops exactly on the coin
     local step = math.min(TARGET_SPEED * dt, distance)
     if step <= 0 then return end
 
     local newPos = virtualPos + direction.Unit * step
-    if not isPositionValid(newPos) then return end
+    if not isFiniteVector(newPos) then return end
 
     virtualPos = newPos
     heldCFrame = nil
@@ -386,16 +348,6 @@ local function isCoin(part)
     return name:find("coin") or name:find("cash") or name:find("money") or name:find("collect")
 end
 
--- Did the game actually take this coin? It is gone when it left the world, when
--- its visual disappeared, or when the visual is flagged as collected. Anything
--- else means the coin is still lying there.
-local function isCoinCollected(coin)
-    if not coin or not coin.Parent then return true end
-    local visual = coin:FindFirstChild("CoinVisual")
-    if not visual then return true end
-    return visual:GetAttribute("Collected") == true
-end
-
 -- The closest usable coin and its distance.
 --
 -- The distance is a plain 3D length between two positions, so the search is a
@@ -407,12 +359,10 @@ end
 local function findNearestCoin(rootPos)
     local nearest = nil
     local nearestDist = MAX_DIST
-    local now = os.clock()
 
     for coin in pairs(activeCoins) do
         if not coin.Parent then
             activeCoins[coin] = nil
-            coinCooldown[coin] = nil
         else
             local visual = coin:FindFirstChild("CoinVisual")
             local coinPos = coin.Position
@@ -424,21 +374,10 @@ local function findNearestCoin(rootPos)
                 and visual:GetAttribute("Collected") ~= true
                 and isFiniteVector(coinPos) then
 
-                -- a coin we touched but could not confirm is left aside for a
-                -- moment, then becomes a target again: it was never taken, so it
-                -- is still worth coming back to.
-                local retryAt = coinCooldown[coin]
-                if retryAt and now >= retryAt then
-                    coinCooldown[coin] = nil
-                    retryAt = nil
-                end
-
-                if not retryAt then
-                    local dist = (coinPos - rootPos).Magnitude
-                    if dist < nearestDist then
-                        nearest = coin
-                        nearestDist = dist
-                    end
+                local dist = (coinPos - rootPos).Magnitude
+                if dist < nearestDist then
+                    nearest = coin
+                    nearestDist = dist
                 end
             end
         end
@@ -447,51 +386,61 @@ local function findNearestCoin(rootPos)
     return nearest, nearestDist
 end
 
--- Takes one coin.
--- A touch is a contact between two parts, and firing it from a few studs away
--- does not reliably register, so the character is put on the coin first -- a hop
--- of at most COLLECT_RADIUS studs -- and then every way the game might listen to
--- a pickup is fired. The whole thing is in a pcall, and each event is optional,
--- so a coin can never throw inside the frame loop.
+-- Takes one coin, from wherever the character happens to be: it flies over the
+-- coin and every way the game might listen to a pickup is fired on the way past.
+-- No teleport and no stopping -- the movement never pauses for a coin.
+--
+-- A missing pickup is almost always a touch that went to the wrong part, or in
+-- the wrong direction, so every plausible target is tried rather than betting on
+-- one: the visual, the coin part itself, and whatever holds the coin -- which is
+-- where the handler sits in some games. Each one is fired in both directions
+-- (character -> coin and coin -> character) and as both a touch start and a
+-- touch end, since some games only answer to one of the four.
+-- The whole thing is in a pcall, and each event call is optional, so a coin can
+-- never throw inside the frame loop.
 local function collectCoin(coin)
     if not rootPart or not rootPart.Parent or not coin or not coin.Parent then return end
 
-    local coinPos = coin.Position
-    if not isFiniteVector(coinPos) then return end
-
-    if (rootPart.Position - coinPos).Magnitude > 0.5 then
-        pcall(function()
-            rootPart.CFrame = CFrame.new(coinPos) * currentRotation()
-            rootPart.AssemblyLinearVelocity = Vector3.zero
-            rootPart.AssemblyAngularVelocity = Vector3.zero
-        end)
-        virtualPos = coinPos
-        heldCFrame = nil
-    end
-
     local visual = coin:FindFirstChild("CoinVisual")
-    local target = visual or coin
+
+    local targets = { coin }
+    if visual then table.insert(targets, visual) end
+    if coin.Parent then table.insert(targets, coin.Parent) end
 
     pcall(function()
         if firetouchinterest then
-            firetouchinterest(rootPart, target, 0)
-            firetouchinterest(rootPart, target, 1)
-            if target ~= coin then
-                firetouchinterest(rootPart, coin, 0)
-                firetouchinterest(rootPart, coin, 1)
+            for _, part in ipairs(targets) do
+                if part and part:IsA("BasePart") then
+                    firetouchinterest(rootPart, part, 0)
+                    firetouchinterest(rootPart, part, 1)
+                    -- the other way round: a few games check the part that is
+                    -- being touched rather than the one doing the touching
+                    firetouchinterest(part, rootPart, 0)
+                    firetouchinterest(part, rootPart, 1)
+                end
             end
         end
 
-        local clickDetector = coin:FindFirstChildOfClass("ClickDetector")
-            or target:FindFirstChildOfClass("ClickDetector")
-            or (coin.Parent and coin.Parent:FindFirstChildOfClass("ClickDetector"))
+        -- the coin, its visual, or whatever holds it -- and if nothing there
+        -- carries the handler, anywhere inside them, since some games hang it a
+        -- level deeper
+        local function findIn(className)
+            for _, node in ipairs({ coin, visual, coin.Parent }) do
+                if node then
+                    local found = node:FindFirstChildOfClass(className)
+                        or node:FindFirstChildOfClass(className, true)
+                    if found then return found end
+                end
+            end
+            return nil
+        end
+
+        local clickDetector = findIn("ClickDetector")
         if clickDetector and fireclickdetector then
             fireclickdetector(clickDetector)
         end
 
-        local prompt = coin:FindFirstChildOfClass("ProximityPrompt")
-            or target:FindFirstChildOfClass("ProximityPrompt")
-            or (coin.Parent and coin.Parent:FindFirstChildOfClass("ProximityPrompt"))
+        local prompt = findIn("ProximityPrompt")
         if prompt and fireproximityprompt then
             fireproximityprompt(prompt)
         end
@@ -506,9 +455,7 @@ end
 
 local function untrackCoin(part)
     activeCoins[part] = nil
-    coinCooldown[part] = nil
     if currentTarget == part then currentTarget = nil end
-    if pendingCoin == part then pendingCoin = nil end
 end
 
 local function scanWorkspaceForCoins()
@@ -576,14 +523,17 @@ local function initCoinListeners()
             isWaitingForCoins = true
             stopMovement()
             currentTarget = nil
-            pendingCoin = nil
             activeCoins = {}
             blacklistedCoins = {}
-            coinCooldown = {}
             noCoinsStartTime = nil
             bagIsFull = false
+            -- forget everything we knew about where the character was: it is
+            -- about to be moved to a new map, and a remembered position from the
+            -- old one would drag it back across the place
+            heldCFrame = nil
+            virtualPos = nil
+            lastGoodPosition = nil
 
-            task.wait(ROUND_START_DELAY)
             scanWorkspaceForCoins()
 
             isWaitingForCoins = false
@@ -1009,7 +959,7 @@ local function cleanupConnections()
 end
 
 local function updateFarm(dt)
-    dt = math.clamp(dt or 0.016, 0.001, MAX_FRAME_DT)
+    dt = dt or 0.016
 
     if not enabled or not rootPart or not rootPart.Parent or not humanoid or humanoid.Health <= 0 then
         stopMovement()
@@ -1025,14 +975,12 @@ local function updateFarm(dt)
 
     local rootPos = rootPart.Position
 
-    -- a position that has gone to nonsense. Put the character back if we have a
-    -- close spot to put it on, otherwise just stop and let the game sort it out.
-    -- Killing here would turn a bad frame into a respawn loop.
-    if not isPositionValid(rootPos) then
+    -- a position that has gone to nonsense (NaN or infinity): put the character
+    -- back on the last spot we know was good, and stop for this frame. Killing
+    -- here would turn a bad frame into a respawn loop.
+    if not isFiniteVector(rootPos) then
         stopMovement()
-        if lastGoodPosition and isFiniteVector(lastGoodPosition)
-            and isFiniteVector(rootPos - lastGoodPosition)
-            and (rootPos - lastGoodPosition).Magnitude <= SNAP_BACK_DISTANCE then
+        if lastGoodPosition then
             pcall(function()
                 rootPart.CFrame = CFrame.new(lastGoodPosition) * currentRotation()
             end)
@@ -1040,29 +988,6 @@ local function updateFarm(dt)
         return
     end
     lastGoodPosition = rootPos
-
-    -- a coin we touched: wait for the game to confirm it before counting it
-    if pendingCoin then
-        if isCoinCollected(pendingCoin) then
-            if not counterFromRemote then
-                coinsCollected = coinsCollected + 1
-            end
-            hasCollectedThisLife = true
-            blacklistedCoins[pendingCoin] = true
-            activeCoins[pendingCoin] = nil
-            coinCooldown[pendingCoin] = nil
-            pendingCoin = nil
-            noCoinsStartTime = nil
-        elseif os.clock() - pendingSince >= PENDING_TIMEOUT then
-            -- never confirmed: it is still lying there, so it becomes a target
-            -- again after a moment instead of being counted or discarded
-            coinCooldown[pendingCoin] = os.clock() + RETRY_DELAY
-            pendingCoin = nil
-        else
-            holdPosition()
-            return
-        end
-    end
 
     -- the closest coin, recomputed every frame -- a coin that just appeared, or
     -- one closer than the current target, takes over immediately
@@ -1101,15 +1026,23 @@ local function updateFarm(dt)
 
     noCoinsStartTime = nil
 
-    -- reached it: take it, then hold on the spot until the game confirms
+    -- close enough: take it and keep flying. No stop, no teleport -- the address
+    -- of the coin is never even used, the touch is fired from where the character
+    -- happens to be.
     if nearestDist <= COLLECT_RADIUS then
         collectCoin(nearest)
-        pendingCoin = nearest
-        pendingSince = os.clock()
-        currentTarget = nearest
+        -- set aside on the spot: the very next frame is already picking the
+        -- coin after it, so the character flies over a coin and never turns back
+        -- for it. No waiting, no timer, nothing to confirm.
+        blacklistedCoins[nearest] = true
+        activeCoins[nearest] = nil
         hasCollectedThisLife = true
-        holdPosition()
-        return
+        currentTarget = nil
+        noCoinsStartTime = nil
+        -- no remote to count with, so the touch is the only evidence there is
+        if not counterFromRemote then
+            coinsCollected = coinsCollected + 1
+        end
     end
 
     stepTowards(nearest.Position, dt)
@@ -1122,8 +1055,6 @@ local function startMovementEngine()
     lastGoodPosition = nil
     heldCFrame = nil
     virtualPos = nil
-    pendingCoin = nil
-    coinCooldown = {}
     showErrors = false
 
     if enabled and not bagIsFull then startNoclip() end
@@ -1164,9 +1095,7 @@ local function unloadScript()
 
     activeCoins = {}
     blacklistedCoins = {}
-    coinCooldown = {}
     currentTarget = nil
-    pendingCoin = nil
     lastGoodPosition = nil
     heldCFrame = nil
     virtualPos = nil
@@ -1183,8 +1112,6 @@ local function loadScript()
     humanoid = character:WaitForChild("Humanoid")
 
     blacklistedCoins = {}
-    coinCooldown = {}
-    pendingCoin = nil
     noCoinsStartTime = nil
     hasCollectedThisLife = false
     coinsCollected = 0
@@ -1204,8 +1131,6 @@ local function loadScript()
         humanoid = character:WaitForChild("Humanoid")
 
         blacklistedCoins = {}
-        coinCooldown = {}
-        pendingCoin = nil
         noCoinsStartTime = nil
         hasCollectedThisLife = false
         bagIsFull = false
