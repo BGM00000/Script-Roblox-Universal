@@ -43,10 +43,10 @@ local remotes = ReplicatedStorage:WaitForChild("Remotes", 5)
 local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 
 -- ============================== SETTINGS ==============================
-local TARGET_SPEED       = 23     -- studs per second, and 23 is the ceiling:
+local TARGET_SPEED       = 22     -- studs per second, and 23 is the ceiling:
                                   -- it keeps the flight smooth and readable
 local MAX_DIST           = 1000   -- radius of the sphere the search covers
-local COLLECT_RADIUS     = 2.8     -- the coin counts as reached this close, which
+local COLLECT_RADIUS     = 2.5     -- the coin counts as reached this close, which
                                   -- is all it takes: the character flies over it
                                   -- and the coin is taken on the way past
 local RETARGET_BIAS      = 0.5    -- a coin must be this much closer to steal the
