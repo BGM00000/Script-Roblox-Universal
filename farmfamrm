@@ -57,7 +57,7 @@ local SNAP_BACK_DISTANCE = 200    -- only snap back to the last good spot if it
                                   -- is close: a long teleport is what a server
                                   -- refuses
 local RESET_DELAY        = 5      -- idle this long with no coin left, then reset
-local ROUND_START_DELAY  = 1.5
+local ROUND_START_DELAY  = 0
 local PENDING_TIMEOUT    = 0.1    -- how long to wait for the game to confirm a
                                   -- coin we just touched
 local RETRY_DELAY        = 4      -- a coin that did not confirm is left alone
@@ -76,8 +76,8 @@ local MAX_ABS_COORD  = 100000
 local HOP_ENABLED          = true
 local HOP_AFTER            = 180 * 60  -- seconds of real farming before leaving
 local HOP_MIN_PLAYERS      = 2
-local HOP_MAX_PLAYERS      = 6
-local HOP_PAGES            = 2
+local HOP_MAX_PLAYERS      = 7
+local HOP_PAGES            = 4
 local HOP_RETRY_DELAY      = 5
 local HOP_MAX_TRY_PER_PASS = 20
 -- join the closest server anyway when none sits in the band? A game whose
