@@ -45,7 +45,7 @@ local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 -- ============================== SETTINGS ==============================
 local TARGET_SPEED       = 22     -- studs per second
 local MAX_DIST           = 1000   -- radius of the sphere the search covers
-local COLLECT_RADIUS     = 4      -- stand on the coin once this close
+local COLLECT_RADIUS     = 2      -- stand on the coin once this close
 local RETARGET_BIAS      = 0.5    -- a coin must be this much closer to steal the
                                   -- target, so two equal coins cannot make the
                                   -- direction flip-flop every frame
@@ -58,9 +58,9 @@ local SNAP_BACK_DISTANCE = 200    -- only snap back to the last good spot if it
                                   -- refuses
 local RESET_DELAY        = 5      -- idle this long with no coin left, then reset
 local ROUND_START_DELAY  = 1.5
-local PENDING_TIMEOUT    = 0.6    -- how long to wait for the game to confirm a
+local PENDING_TIMEOUT    = 0.3    -- how long to wait for the game to confirm a
                                   -- coin we just touched
-local RETRY_DELAY        = 3      -- a coin that did not confirm is left alone
+local RETRY_DELAY        = 4      -- a coin that did not confirm is left alone
                                   -- this long, then it is a target again
 local ANTI_FLING_MAX_SPEED = 30   -- above this a velocity is treated as a fling
                                   -- and damped; well clear of TARGET_SPEED
