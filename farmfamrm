@@ -74,7 +74,7 @@ local MAX_ABS_COORD  = 100000
 
 -- server hop
 local HOP_ENABLED          = true
-local HOP_AFTER            = 60 * 60  -- seconds of real farming before leaving
+local HOP_AFTER            = 2 * 60  -- seconds of real farming before leaving
 local HOP_MIN_PLAYERS      = 3
 local HOP_MAX_PLAYERS      = 6
 local HOP_PAGES            = 2
