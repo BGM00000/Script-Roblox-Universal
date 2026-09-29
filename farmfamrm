@@ -58,7 +58,7 @@ local SNAP_BACK_DISTANCE = 200    -- only snap back to the last good spot if it
                                   -- refuses
 local RESET_DELAY        = 5      -- idle this long with no coin left, then reset
 local ROUND_START_DELAY  = 1.5
-local PENDING_TIMEOUT    = 0.3    -- how long to wait for the game to confirm a
+local PENDING_TIMEOUT    = 0.1    -- how long to wait for the game to confirm a
                                   -- coin we just touched
 local RETRY_DELAY        = 4      -- a coin that did not confirm is left alone
                                   -- this long, then it is a target again
@@ -74,8 +74,8 @@ local MAX_ABS_COORD  = 100000
 
 -- server hop
 local HOP_ENABLED          = true
-local HOP_AFTER            = 2 * 60  -- seconds of real farming before leaving
-local HOP_MIN_PLAYERS      = 3
+local HOP_AFTER            = 180 * 60  -- seconds of real farming before leaving
+local HOP_MIN_PLAYERS      = 2
 local HOP_MAX_PLAYERS      = 6
 local HOP_PAGES            = 2
 local HOP_RETRY_DELAY      = 5
