@@ -43,7 +43,7 @@ local remotes = ReplicatedStorage:WaitForChild("Remotes", 5)
 local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 
 -- ============================== SETTINGS ==============================
-local TARGET_SPEED       = 21     -- studs per second, and 23 is the ceiling:
+local TARGET_SPEED       = 22     -- studs per second, and 23 is the ceiling:
                                   -- it keeps the flight smooth and readable
 local MAX_DIST           = 1000   -- radius of the sphere the search covers
 local COLLECT_RADIUS     = 2.5     -- the coin counts as reached this close, which
