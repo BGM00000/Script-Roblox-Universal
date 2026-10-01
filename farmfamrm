@@ -49,21 +49,21 @@ local MAX_DIST           = 1000   -- radius of the sphere the search covers
 local COLLECT_RADIUS     = 2     -- the coin counts as reached this close, which
                                   -- is all it takes: the character flies over it
                                   -- and the coin is taken on the way past
-local RETARGET_BIAS      = 0.4    -- a coin must be this much closer to steal the
+local RETARGET_BIAS      = 1    -- a coin must be this much closer to steal the
                                   -- target, so two equal coins cannot make the
                                   -- direction flip-flop every frame
 local RESET_DELAY        = 15     -- idle this long with no coin left, then reset
-local ANTI_FLING_MAX_SPEED = 20   -- above this a velocity is treated as a fling
+local ANTI_FLING_MAX_SPEED = 15   -- above this a velocity is treated as a fling
                                   -- and damped; well clear of TARGET_SPEED
 
 -- server hop
 local HOP_ENABLED          = true
-local HOP_AFTER            = 120 * 60  -- seconds of real farming before leaving
-local HOP_MIN_PLAYERS      = 2
-local HOP_MAX_PLAYERS      = 7
-local HOP_PAGES            = 4
-local HOP_RETRY_DELAY      = 5
-local HOP_MAX_TRY_PER_PASS = 20
+local HOP_AFTER            = 60 * 60  -- seconds of real farming before leaving
+local HOP_MIN_PLAYERS      = 1
+local HOP_MAX_PLAYERS      = 6
+local HOP_PAGES            = 3
+local HOP_RETRY_DELAY      = 10
+local HOP_MAX_TRY_PER_PASS = 25
 -- join the closest server anyway when none sits in the band? A game whose
 -- servers are all full or all empty would otherwise be hopped at forever and
 -- never left. The console line before each sweep says what was available.
