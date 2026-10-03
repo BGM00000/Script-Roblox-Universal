@@ -46,7 +46,7 @@ local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 local TARGET_SPEED       = 21     -- studs per second, and 23 is the ceiling:
                                   -- it keeps the flight smooth and readable
 local MAX_DIST           = 1000   -- radius of the sphere the search covers
-local COLLECT_RADIUS     = 2.5     -- the coin counts as reached this close, which
+local COLLECT_RADIUS     = 3     -- the coin counts as reached this close, which
                                   -- is all it takes: the character flies over it
                                   -- and the coin is taken on the way past
 local RETARGET_BIAS      = 1    -- a coin must be this much closer to steal the
@@ -77,7 +77,7 @@ local MURDERER_PREFER  = 15   -- coins closer to him than this are put in a
                               -- this preference off entirely
 local MURDERER_FLEE    = true -- when he is already inside the radius, walk
                               -- away from him instead of farming
-local MURDERER_FLEE_STEP = 12 -- how far a single retreat aims, in studs. At
+local MURDERER_FLEE_STEP = 13 -- how far a single retreat aims, in studs. At
                               -- least twice the radius, so one retreat really
                               -- leaves the zone instead of stopping on its edge
 
@@ -85,8 +85,8 @@ local MURDERER_FLEE_STEP = 12 -- how far a single retreat aims, in studs. At
 local HOP_ENABLED          = true
 local HOP_AFTER            = 60 * 60  -- seconds of real farming before leaving
 local HOP_MIN_PLAYERS      = 4
-local HOP_MAX_PLAYERS      = 6
-local HOP_PAGES            = 3
+local HOP_MAX_PLAYERS      = 7
+local HOP_PAGES            = 4
 local HOP_RETRY_DELAY      = 10
 local HOP_MAX_TRY_PER_PASS = 25
 -- join the closest server anyway when none sits in the band? A game whose
@@ -1357,8 +1357,8 @@ ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.DisplayOrder = 2147483647   -- over every other interface
 
 Main = Instance.new("Frame")
-Main.Size = UDim2.new(0, 272, 0, 425)
-Main.Position = UDim2.new(0.5, -136, 0.5, -212)
+Main.Size = UDim2.new(0, 272, 0, 485)
+Main.Position = UDim2.new(0.5, -136, 0.5, -242)
 Main.BackgroundColor3 = C_BG
 Main.BorderSizePixel = 0
 Main.Parent = ScreenGui
@@ -1699,12 +1699,106 @@ hopDesc = hopDescLabel
 
 divider(358)
 
+-- ------------------------------ hop button ------------------------------
+-- Leaves for another server on demand, instead of waiting out the countdown.
+-- Useful to test the hop, and to leave a server that has turned bad.
+local HopBtn = Instance.new("TextButton")
+HopBtn.Size = UDim2.new(1, -12, 0, 26)
+HopBtn.Position = UDim2.new(0, 6, 0, 359)
+HopBtn.BackgroundColor3 = C_PANEL
+HopBtn.BackgroundTransparency = 0.35
+HopBtn.Text = "Hop now"
+HopBtn.TextColor3 = C_TEXT
+HopBtn.Font = F_LABEL
+HopBtn.TextSize = 11
+HopBtn.AutoButtonColor = false
+HopBtn.BorderSizePixel = 0
+HopBtn.Parent = Main
+
+local hopBtnCorner = Instance.new("UICorner")
+hopBtnCorner.CornerRadius = UDim.new(0, 5)
+hopBtnCorner.Parent = HopBtn
+
+local hopBtnBorder = Instance.new("UIStroke")
+hopBtnBorder.Color = C_LINE
+hopBtnBorder.Thickness = 1
+hopBtnBorder.Parent = HopBtn
+
+HopBtn.MouseEnter:Connect(function()
+    TweenService:Create(HopBtn, TweenInfo.new(0.12), {BackgroundTransparency = 0.1}):Play()
+end)
+HopBtn.MouseLeave:Connect(function()
+    TweenService:Create(HopBtn, TweenInfo.new(0.12), {BackgroundTransparency = 0.35}):Play()
+end)
+HopBtn.MouseButton1Click:Connect(function()
+    if hopRunning then return end
+    farmTime = 0            -- the countdown starts over from the hop
+    task.spawn(serverHop)
+end)
+
+divider(390)
+
+-- ------------------------------ total coins ------------------------------
+-- The game's own balance, read from its shop interface. That is the running
+-- total across every round and every server -- something the session counter
+-- further down cannot show.
+local function findShopAmount()
+    local playerGui = player:FindFirstChild("PlayerGui")
+    if not playerGui then return nil end
+
+    local node = playerGui
+    for _, name in ipairs({ "CrossPlatform", "Shop", "Medium", "Title", "Coins", "Container", "Amount" }) do
+        node = node:FindFirstChild(name)
+        if not node then return nil end
+    end
+    return node
+end
+
+local shopAmountLabel = nil
+local lastShopLookup = 0
+
+-- the shop interface is not always loaded, so the label is looked up again
+-- whenever the one we hold goes away. The text is shown exactly as the game
+-- writes it: it may use separators or shorten large numbers, and parsing that
+-- back to a number would be guesswork.
+local function refreshShopAmount()
+    local now = os.clock()
+    if (not shopAmountLabel or not shopAmountLabel.Parent) and now - lastShopLookup >= 1 then
+        lastShopLookup = now
+        shopAmountLabel = findShopAmount()
+    end
+end
+
+local TotalLabel = Instance.new("TextLabel")
+TotalLabel.Size = UDim2.new(0, 110, 0, 16)
+TotalLabel.Position = UDim2.new(0, 12, 0, 392)
+TotalLabel.BackgroundTransparency = 1
+TotalLabel.Text = "Total coins"
+TotalLabel.TextColor3 = C_DIM
+TotalLabel.Font = F_TEXT
+TotalLabel.TextSize = 11
+TotalLabel.TextXAlignment = Enum.TextXAlignment.Left
+TotalLabel.Parent = Main
+
+local TotalValue = Instance.new("TextLabel")
+TotalValue.Size = UDim2.new(0, 130, 0, 16)
+TotalValue.Position = UDim2.new(1, -142, 0, 392)
+TotalValue.BackgroundTransparency = 1
+TotalValue.Text = "—"
+TotalValue.TextColor3 = C_TEXT
+TotalValue.Font = F_NUM
+TotalValue.TextSize = 13
+TotalValue.TextXAlignment = Enum.TextXAlignment.Right
+TotalValue.Parent = Main
+
+divider(418)
+
 -- ---------------------------------- readout ----------------------------------
 -- The one loud element: how many coins taken, how far the next one is, and a bar
 -- that fills as the character closes in.
 local Readout = Instance.new("Frame")
 Readout.Size = UDim2.new(1, -32, 0, 58)
-Readout.Position = UDim2.new(0, 16, 0, 361)
+Readout.Position = UDim2.new(0, 16, 0, 421)
 Readout.BackgroundTransparency = 1
 Readout.Parent = Main
 
@@ -1786,6 +1880,11 @@ task.spawn(function()
         DistValue.Text = dist and string.format("%d", math.floor(dist + 0.5)) or "—"
         DistCaption.Text = dist and "studs to closest coin" or "no coin in range"
 
+        -- the running balance, straight from the shop label. It reads "—" until
+        -- the game's shop interface has been built, which happens on its own.
+        refreshShopAmount()
+        TotalValue.Text = shopAmountLabel and shopAmountLabel.Text or "—"
+
         local fraction = dist and math.clamp(1 - dist / GAUGE_RANGE, 0, 1) or 0
         TweenService:Create(GaugeFill, TweenInfo.new(0.15, Enum.EasingStyle.Linear), {
             Size = UDim2.new(fraction, 0, 1, 0),
@@ -1809,7 +1908,11 @@ task.spawn(function()
             end
         end
 
-        -- the hop row doubles as a countdown
+        -- the hop row doubles as a countdown, and the button says what it is
+        -- doing so a click that seems to do nothing is explained
+        HopBtn.Text = hopRunning and "Hopping…" or "Hop now"
+        HopBtn.TextColor3 = hopRunning and C_DIM or C_TEXT
+
         if hopDesc then
             if not HOP_ENABLED then
                 hopDesc.Text = "Off"
