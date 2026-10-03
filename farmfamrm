@@ -105,7 +105,7 @@ local afkActive        = true    -- anti-AFK
 local antiFlingEnabled = true
 local antiFlingStrength = 1
 local lowRender        = true    -- draw nothing, save battery
-local murdererAvoid    = true    -- prefer coins away from the knifeman
+local murdererAvoid    = false    -- prefer coins away from the knifeman
 
 local isLoaded         = false
 local bagIsFull        = false
