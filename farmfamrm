@@ -46,14 +46,14 @@ local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 local TARGET_SPEED       = 21     -- studs per second, and 23 is the ceiling:
                                   -- it keeps the flight smooth and readable
 local MAX_DIST           = 1000   -- radius of the sphere the search covers
-local COLLECT_RADIUS     = 3     -- the coin counts as reached this close, which
+local COLLECT_RADIUS     = 2     -- the coin counts as reached this close, which
                                   -- is all it takes: the character flies over it
                                   -- and the coin is taken on the way past
 local RETARGET_BIAS      = 1    -- a coin must be this much closer to steal the
                                   -- target, so two equal coins cannot make the
                                   -- direction flip-flop every frame
-local RESET_DELAY        = 20     -- idle this long with no coin left, then reset
-local ANTI_FLING_MAX_SPEED = 30   -- above this a velocity is treated as a fling
+local RESET_DELAY        = 15     -- idle this long with no coin left, then reset
+local ANTI_FLING_MAX_SPEED = 15   -- above this a velocity is treated as a fling
                                   -- and damped; well clear of TARGET_SPEED
 
 -- server hop
