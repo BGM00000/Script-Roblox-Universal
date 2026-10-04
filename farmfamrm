@@ -43,7 +43,7 @@ local remotes = ReplicatedStorage:WaitForChild("Remotes", 5)
 local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 
 -- ============================== SETTINGS ==============================
-local TARGET_SPEED       = 21     -- studs per second, and 23 is the ceiling:
+local TARGET_SPEED       = 21     -- studs per second, and 21 is the ceiling:
                                   -- it keeps the flight smooth and readable
 local MAX_DIST           = 1000   -- radius of the sphere the search covers
 local COLLECT_RADIUS     = 2     -- the coin counts as reached this close, which
@@ -53,13 +53,13 @@ local RETARGET_BIAS      = 1    -- a coin must be this much closer to steal the
                                   -- target, so two equal coins cannot make the
                                   -- direction flip-flop every frame
 local RESET_DELAY        = 15     -- idle this long with no coin left, then reset
-local ANTI_FLING_MAX_SPEED = 15   -- above this a velocity is treated as a fling
+local ANTI_FLING_MAX_SPEED = 14   -- above this a velocity is treated as a fling
                                   -- and damped; well clear of TARGET_SPEED
 
 -- server hop
 local HOP_ENABLED          = true
 local HOP_AFTER            = 60 * 60  -- seconds of real farming before leaving
-local HOP_MIN_PLAYERS      = 4
+local HOP_MIN_PLAYERS      = 3
 local HOP_MAX_PLAYERS      = 7
 local HOP_PAGES            = 4
 local HOP_RETRY_DELAY      = 10
