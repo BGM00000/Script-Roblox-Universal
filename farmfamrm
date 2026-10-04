@@ -43,52 +43,27 @@ local remotes = ReplicatedStorage:WaitForChild("Remotes", 5)
 local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 
 -- ============================== SETTINGS ==============================
-local TARGET_SPEED       = 21     -- studs per second, and 23 is the ceiling:
+local TARGET_SPEED       = 23     -- studs per second, and 23 is the ceiling:
                                   -- it keeps the flight smooth and readable
 local MAX_DIST           = 1000   -- radius of the sphere the search covers
-local COLLECT_RADIUS     = 3     -- the coin counts as reached this close, which
+local COLLECT_RADIUS     = 2.8     -- the coin counts as reached this close, which
                                   -- is all it takes: the character flies over it
                                   -- and the coin is taken on the way past
-local RETARGET_BIAS      = 1    -- a coin must be this much closer to steal the
+local RETARGET_BIAS      = 0.5    -- a coin must be this much closer to steal the
                                   -- target, so two equal coins cannot make the
                                   -- direction flip-flop every frame
-local RESET_DELAY        = 20     -- idle this long with no coin left, then reset
+local RESET_DELAY        = 30     -- idle this long with no coin left, then reset
 local ANTI_FLING_MAX_SPEED = 30   -- above this a velocity is treated as a fling
                                   -- and damped; well clear of TARGET_SPEED
 
--- Keeping away from the murderer. He carries the knife, and dying throws away
--- the whole round's coins, so his surroundings are treated as an obstacle rather
--- than as somewhere slightly less attractive.
---
--- This is a HARD rule, not a preference: the character never enters
--- MURDERER_RADIUS of him, coin or no coin. It is enforced on the movement
--- itself, so it holds no matter what the farm is trying to reach: every step
--- has its inward component toward him removed before it is applied, and a step
--- that carries no motion toward a point can never reduce the distance to it.
--- The character slides around him instead of going through him -- and if he
--- walks into you, the flee below backs straight out.
-
-
-local MURDERER_RADIUS  = 12   -- the keep-out radius. Never entered, and a coin
-                              -- sitting inside it is never even targeted
-local MURDERER_PREFER  = 15   -- coins closer to him than this are put in a
-                              -- second pile: taken only if nothing calmer is on
-                              -- offer. Set equal to MURDERER_RADIUS to switch
-                              -- this preference off entirely
-local MURDERER_FLEE    = true -- when he is already inside the radius, walk
-                              -- away from him instead of farming
-local MURDERER_FLEE_STEP = 13 -- how far a single retreat aims, in studs. At
-                              -- least twice the radius, so one retreat really
-                              -- leaves the zone instead of stopping on its edge
-
 -- server hop
 local HOP_ENABLED          = true
-local HOP_AFTER            = 60 * 60  -- seconds of real farming before leaving
-local HOP_MIN_PLAYERS      = 4
+local HOP_AFTER            = 180 * 60  -- seconds of real farming before leaving
+local HOP_MIN_PLAYERS      = 2
 local HOP_MAX_PLAYERS      = 7
 local HOP_PAGES            = 4
-local HOP_RETRY_DELAY      = 10
-local HOP_MAX_TRY_PER_PASS = 25
+local HOP_RETRY_DELAY      = 5
+local HOP_MAX_TRY_PER_PASS = 20
 -- join the closest server anyway when none sits in the band? A game whose
 -- servers are all full or all empty would otherwise be hopped at forever and
 -- never left. The console line before each sweep says what was available.
@@ -105,7 +80,6 @@ local afkActive        = true    -- anti-AFK
 local antiFlingEnabled = true
 local antiFlingStrength = 1
 local lowRender        = true    -- draw nothing, save battery
-local murdererAvoid    = false    -- prefer coins away from the knifeman
 
 local isLoaded         = false
 local bagIsFull        = false
@@ -149,11 +123,6 @@ local hopRunning = false
 local ScreenGui = nil
 local Main = nil
 local hopDesc = nil
-local murdererDesc = nil
-
--- avoidance state, for the interface
-local murdererDistance = nil   -- studs to the murderer, nil when he is not around
-local murdererAvoiding = false -- true while backing away from him
 
 local characterParts = {}
 
@@ -166,90 +135,6 @@ end
 
 local function isFiniteVector(v)
     return isFiniteNumber(v.X) and isFiniteNumber(v.Y) and isFiniteNumber(v.Z)
-end
-
--- ============================== MURDERER ==============================
--- In this game the murderer is the player carrying the knife, and the sheriff
--- the one carrying the gun -- both sit in the backpack, and the held one is a
--- child of the character. Only the knife matters here: the gun is on your side.
-local function knifeHolderPosition()
-    for _, other in ipairs(Players:GetPlayers()) do
-        if other ~= player then
-            local char = other.Character
-            if char and char.Parent then
-                local otherHumanoid = char:FindFirstChildOfClass("Humanoid")
-                if otherHumanoid and otherHumanoid.Health > 0 then
-                    local backpack = other:FindFirstChildOfClass("Backpack")
-                    local knife = char:FindFirstChild("Knife")
-                        or (backpack and backpack:FindFirstChild("Knife"))
-                    if knife then
-                        local otherRoot = char:FindFirstChild("HumanoidRootPart")
-                        local pos = otherRoot and otherRoot.Position
-                        if pos and isFiniteVector(pos) then
-                            return pos
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return nil
-end
-
--- How close the murderer stands to the straight line from here to the coin.
--- A coin can be far from him and still be a bad idea if the way to it goes
--- right past him, so the route is checked, not just the destination.
-local function pointToSegment(point, a, b)
-    local ab = b - a
-    local lengthSq = ab:Dot(ab)
-    if lengthSq < 1e-6 then
-        return (point - a).Magnitude
-    end
-    local t = math.clamp((point - a):Dot(ab) / lengthSq, 0, 1)
-    return (point - (a + ab * t)).Magnitude
-end
-
--- 0 = out of his way, 1 = near enough to be a second choice,
--- 2 = inside the keep-out radius, so not a target at all
-local function coinRisk(coinPos, rootPos, murdererPos)
-    if not murdererPos then return 0 end
-
-    -- where the coin is matters, but so does the way to it: a coin far from him
-    -- is still a bad idea if the straight line to it crosses his radius
-    local closest = math.min(
-        (coinPos - murdererPos).Magnitude,
-        pointToSegment(murdererPos, rootPos, coinPos))
-
-    if closest < MURDERER_RADIUS then return 2 end
-    if closest < MURDERER_PREFER then return 1 end
-    return 0
-end
-
--- The murderer's position for this frame, shared with the movement so a step can
--- never be taken into his radius. nil when there is no murderer in the round,
--- in which case nothing about the movement changes.
-local murdererPosition = nil
-
--- Removes from a step any motion that goes toward a point. A step with no
--- component toward the point cannot reduce the distance to it -- so once the
--- character is outside a radius, this makes it impossible for it to get inside.
--- The rest of the step is kept, so the character keeps moving: it slides around
--- the murderer rather than stopping dead in front of him.
-local function avoidPoint(fromPos, toPos, point, radius)
-    if not point then return toPos end
-
-    local next_ = toPos
-    if (next_ - point).Magnitude >= radius then return next_ end
-
-    local away = fromPos - point
-    if away.Magnitude < 0.1 then return next_ end   -- standing on him: let flee handle it
-
-    local awayHat = away.Unit
-    local inward = -(next_ - fromPos):Dot(awayHat)
-    if inward > 0 then
-        next_ = next_ + awayHat * inward
-    end
-    return next_
 end
 
 -- the orientation to keep when the character is moved. Only read back while the
@@ -324,11 +209,6 @@ local function stepTowards(targetPos, dt)
     if step <= 0 then return end
 
     local newPos = virtualPos + direction.Unit * step
-
-    -- The keep-out is applied here, on the step itself, so it holds whatever the
-    -- farm is trying to reach. This is what makes "never near the murderer" a
-    -- guarantee instead of a hope.
-    newPos = avoidPoint(virtualPos, newPos, murdererPosition, MURDERER_RADIUS)
     if not isFiniteVector(newPos) then return end
 
     virtualPos = newPos
@@ -468,8 +348,7 @@ local function isCoin(part)
     return name:find("coin") or name:find("cash") or name:find("money") or name:find("collect")
 end
 
--- The closest usable coin and its distance, plus how exposed it is
--- (0 out of the murderer's way, 1 near him).
+-- The closest usable coin and its distance.
 --
 -- The distance is a plain 3D length between two positions, so the search is a
 -- full sphere: above, below, behind, to the sides, all at once. Nothing filters
@@ -477,15 +356,9 @@ end
 --
 -- Called every frame, so a coin that appeared a moment ago is already a
 -- candidate, and a coin that is closer than the current target takes over.
---
--- Coins are gathered in two piles, calm and near-him, and the calm pile wins
--- whenever it holds anything. That is what makes a coin further away but out of
--- his way beat a nearer one sitting beside him -- while still picking the
--- closest coin of the pile it settles on. A coin inside his radius is not put in
--- either pile: it is not a target at all.
-local function findNearestCoin(rootPos, murdererPos)
-    local bestCoin = { nil, nil }
-    local bestDist = { MAX_DIST, MAX_DIST }
+local function findNearestCoin(rootPos)
+    local nearest = nil
+    local nearestDist = MAX_DIST
 
     for coin in pairs(activeCoins) do
         if not coin.Parent then
@@ -501,29 +374,16 @@ local function findNearestCoin(rootPos, murdererPos)
                 and visual:GetAttribute("Collected") ~= true
                 and isFiniteVector(coinPos) then
 
-                local risk = coinRisk(coinPos, rootPos, murdererPos)
-
-                -- inside his radius: unreachable by design, so not a candidate
-                if risk < 2 then
-                    local dist = (coinPos - rootPos).Magnitude
-                    local pile = risk + 1
-
-                    if dist < bestDist[pile] then
-                        bestDist[pile] = dist
-                        bestCoin[pile] = coin
-                    end
+                local dist = (coinPos - rootPos).Magnitude
+                if dist < nearestDist then
+                    nearest = coin
+                    nearestDist = dist
                 end
             end
         end
     end
 
-    for pile = 1, 2 do
-        if bestCoin[pile] then
-            return bestCoin[pile], bestDist[pile], pile - 1
-        end
-    end
-
-    return nil, MAX_DIST, 0
+    return nearest, nearestDist
 end
 
 -- Takes one coin, from wherever the character happens to be: it flies over the
@@ -820,7 +680,7 @@ local function hopLog(message)
 end
 
 local function fetchServers(cursor)
-    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true")
+    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true")
         :format(game.PlaceId)
     if cursor and cursor ~= "" and cursor ~= "null" then
         url = url .. "&cursor=" .. cursor
@@ -1129,60 +989,20 @@ local function updateFarm(dt)
     end
     lastGoodPosition = rootPos
 
-    -- where the murderer is, if he is in the round at all. Nothing changes when
-    -- he is not: the farm behaves exactly as it always did.
-    local murdererPos = nil
-    if murdererAvoid then
-        murdererPos = knifeHolderPosition()
-    end
-    murdererPosition = murdererPos
-    murdererDistance = murdererPos and (murdererPos - rootPos).Magnitude or nil
-
-    -- He is already inside the keep-out, so the only thing that matters is
-    -- getting out. Coins are ignored until then -- a coin is never worth
-    -- standing in knife range, and the search resumes by itself once clear.
-    if murdererPos and (murdererPos - rootPos).Magnitude < MURDERER_RADIUS then
-        murdererAvoiding = true
-        currentTarget = nil
-        -- the reset timer is held off: this is deliberate waiting, not a round
-        -- that has run dry
-        noCoinsStartTime = nil
-
-        if MURDERER_FLEE then
-            local away = rootPos - murdererPos
-            away = Vector3.new(away.X, 0, away.Z)   -- sideways only, never down
-            if away.Magnitude > 0.1 then
-                stepTowards(rootPos + away.Unit * MURDERER_FLEE_STEP, dt)
-                return
-            end
-        end
-
-        -- nowhere to back off to (standing exactly on him): just freeze
-        holdPosition()
-        return
-    end
-
     -- the closest coin, recomputed every frame -- a coin that just appeared, or
     -- one closer than the current target, takes over immediately
-    local nearest, nearestDist, risk = findNearestCoin(rootPos, murdererPos)
+    local nearest, nearestDist = findNearestCoin(rootPos)
 
-    -- keep the current target only while nothing meaningfully closer shows up,
-    -- and never hold on to it once it has become the more exposed choice
+    -- keep the current target only while nothing meaningfully closer shows up
     if nearest and currentTarget and currentTarget.Parent and not blacklistedCoins[currentTarget]
         and isFiniteVector(currentTarget.Position) then
         local currentDist = (currentTarget.Position - rootPos).Magnitude
-        local currentRisk = coinRisk(currentTarget.Position, rootPos, murdererPos)
-        if currentDist > COLLECT_RADIUS
-            and currentDist <= nearestDist + RETARGET_BIAS
-            and currentRisk <= risk then
+        if currentDist > COLLECT_RADIUS and currentDist <= nearestDist + RETARGET_BIAS then
             nearest = currentTarget
             nearestDist = currentDist
-            risk = currentRisk
         end
     end
-
     currentTarget = nearest
-    murdererAvoiding = false
 
     if not currentTarget then
         -- no coin to go to. Once a coin has been collected this life we are
@@ -1357,8 +1177,8 @@ ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.DisplayOrder = 2147483647   -- over every other interface
 
 Main = Instance.new("Frame")
-Main.Size = UDim2.new(0, 272, 0, 485)
-Main.Position = UDim2.new(0.5, -136, 0.5, -242)
+Main.Size = UDim2.new(0, 272, 0, 436)
+Main.Position = UDim2.new(0.5, -136, 0.5, -218)
 Main.BackgroundColor3 = C_BG
 Main.BorderSizePixel = 0
 Main.Parent = ScreenGui
@@ -1682,29 +1502,21 @@ end)
 
 divider(264)
 
--- the description line of this row is taken over by the live distance
-local _, murdererDescLabel = createRow(265, "Avoid murderer", "Prefers coins away from him", true, function(state)
-    murdererAvoid = state
-end)
-murdererDesc = murdererDescLabel
-
-divider(311)
-
 -- the description line of this row is taken over by the countdown
-local _, hopDescLabel = createRow(312, "Server hop", "Every 60 min", HOP_ENABLED, function(state)
+local _, hopDescLabel = createRow(265, "Server hop", "Every 60 min", HOP_ENABLED, function(state)
     HOP_ENABLED = state
     if state then farmTime = 0 end
 end)
 hopDesc = hopDescLabel
 
-divider(358)
+divider(311)
 
 -- ------------------------------ hop button ------------------------------
 -- Leaves for another server on demand, instead of waiting out the countdown.
 -- Useful to test the hop, and to leave a server that has turned bad.
 local HopBtn = Instance.new("TextButton")
 HopBtn.Size = UDim2.new(1, -12, 0, 26)
-HopBtn.Position = UDim2.new(0, 6, 0, 359)
+HopBtn.Position = UDim2.new(0, 6, 0, 312)
 HopBtn.BackgroundColor3 = C_PANEL
 HopBtn.BackgroundTransparency = 0.35
 HopBtn.Text = "Hop now"
@@ -1736,12 +1548,12 @@ HopBtn.MouseButton1Click:Connect(function()
     task.spawn(serverHop)
 end)
 
-divider(390)
+divider(343)
 
 -- ------------------------------ total coins ------------------------------
 -- The game's own balance, read from its shop interface. That is the running
 -- total across every round and every server -- something the session counter
--- further down cannot show.
+-- in the readout below cannot show.
 local function findShopAmount()
     local playerGui = player:FindFirstChild("PlayerGui")
     if not playerGui then return nil end
@@ -1757,10 +1569,10 @@ end
 local shopAmountLabel = nil
 local lastShopLookup = 0
 
--- the shop interface is not always loaded, so the label is looked up again
--- whenever the one we hold goes away. The text is shown exactly as the game
+-- the shop interface is not always there, so the label is looked up again
+-- whenever the one we hold goes away. Its text is shown exactly as the game
 -- writes it: it may use separators or shorten large numbers, and parsing that
--- back to a number would be guesswork.
+-- back into a number would be guesswork.
 local function refreshShopAmount()
     local now = os.clock()
     if (not shopAmountLabel or not shopAmountLabel.Parent) and now - lastShopLookup >= 1 then
@@ -1771,7 +1583,7 @@ end
 
 local TotalLabel = Instance.new("TextLabel")
 TotalLabel.Size = UDim2.new(0, 110, 0, 16)
-TotalLabel.Position = UDim2.new(0, 12, 0, 392)
+TotalLabel.Position = UDim2.new(0, 12, 0, 345)
 TotalLabel.BackgroundTransparency = 1
 TotalLabel.Text = "Total coins"
 TotalLabel.TextColor3 = C_DIM
@@ -1782,7 +1594,7 @@ TotalLabel.Parent = Main
 
 local TotalValue = Instance.new("TextLabel")
 TotalValue.Size = UDim2.new(0, 130, 0, 16)
-TotalValue.Position = UDim2.new(1, -142, 0, 392)
+TotalValue.Position = UDim2.new(1, -142, 0, 345)
 TotalValue.BackgroundTransparency = 1
 TotalValue.Text = "—"
 TotalValue.TextColor3 = C_TEXT
@@ -1791,14 +1603,14 @@ TotalValue.TextSize = 13
 TotalValue.TextXAlignment = Enum.TextXAlignment.Right
 TotalValue.Parent = Main
 
-divider(418)
+divider(371)
 
 -- ---------------------------------- readout ----------------------------------
 -- The one loud element: how many coins taken, how far the next one is, and a bar
 -- that fills as the character closes in.
 local Readout = Instance.new("Frame")
 Readout.Size = UDim2.new(1, -32, 0, 58)
-Readout.Position = UDim2.new(0, 16, 0, 421)
+Readout.Position = UDim2.new(0, 16, 0, 374)
 Readout.BackgroundTransparency = 1
 Readout.Parent = Main
 
@@ -1881,7 +1693,7 @@ task.spawn(function()
         DistCaption.Text = dist and "studs to closest coin" or "no coin in range"
 
         -- the running balance, straight from the shop label. It reads "—" until
-        -- the game's shop interface has been built, which happens on its own.
+        -- the game has built its shop interface, which happens on its own.
         refreshShopAmount()
         TotalValue.Text = shopAmountLabel and shopAmountLabel.Text or "—"
 
@@ -1890,29 +1702,12 @@ task.spawn(function()
             Size = UDim2.new(fraction, 0, 1, 0),
         }):Play()
 
-        -- the murderer row doubles as a live distance readout
-        if murdererDesc then
-            if not murdererAvoid then
-                murdererDesc.Text = "Off"
-            elseif not enabled or bagIsFull or isWaitingForCoins then
-                -- the farm is not running, so the last distance would be stale
-                murdererDesc.Text = "Prefers coins away from him"
-            elseif murdererAvoiding then
-                murdererDesc.Text = string.format("Backing off · %d studs",
-                    math.floor((murdererDistance or 0) + 0.5))
-            elseif murdererDistance then
-                murdererDesc.Text = string.format("%d studs · avoiding his coins",
-                    math.floor(murdererDistance + 0.5))
-            else
-                murdererDesc.Text = "No murderer in this round"
-            end
-        end
-
-        -- the hop row doubles as a countdown, and the button says what it is
-        -- doing so a click that seems to do nothing is explained
+        -- the button says what it is doing, so a click that seems to do nothing
+        -- is explained
         HopBtn.Text = hopRunning and "Hopping…" or "Hop now"
         HopBtn.TextColor3 = hopRunning and C_DIM or C_TEXT
 
+        -- the hop row doubles as a countdown
         if hopDesc then
             if not HOP_ENABLED then
                 hopDesc.Text = "Off"
