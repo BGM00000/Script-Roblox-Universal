@@ -342,10 +342,28 @@ local function antiAfkLoop()
 end
 
 -- ============================== COINS ==============================
+-- The event renames its pickups: at Halloween the coins become candy, so a part
+-- called candy or candies is the same thing under another name.
 local function isCoin(part)
     if not part:IsA("BasePart") or blacklistedCoins[part] then return false end
     local name = part.Name:lower()
-    return name:find("coin") or name:find("cash") or name:find("money") or name:find("collect")
+    return name:find("coin") or name:find("candy") or name:find("candies")
+        or name:find("candie") or name:find("money") or name:find("collect")
+end
+
+-- The part the game flags "Collected" and expects the touch on. It is CoinVisual
+-- on a normal coin; a renamed pickup may well carry a renamed visual, so any
+-- child with "visual" in its name is accepted, and the pickup itself is the last
+-- resort -- a coin is never dropped for want of a correctly named child.
+local function coinVisual(coin)
+    local visual = coin:FindFirstChild("CoinVisual")
+    if visual then return visual end
+    for _, child in ipairs(coin:GetChildren()) do
+        if child:IsA("BasePart") and child.Name:lower():find("visual") then
+            return child
+        end
+    end
+    return coin
 end
 
 -- The closest usable coin and its distance.
@@ -364,12 +382,12 @@ local function findNearestCoin(rootPos)
         if not coin.Parent then
             activeCoins[coin] = nil
         else
-            local visual = coin:FindFirstChild("CoinVisual")
+            local visual = coinVisual(coin)
             local coinPos = coin.Position
 
-            -- skip anything unusable: no visual, already taken by someone else,
-            -- or a broken position. It stays in the list -- DescendantRemoving
-            -- is what removes a coin for good.
+            -- skip anything unusable: already taken by someone else, or a
+            -- broken position. It stays in the list -- DescendantRemoving is
+            -- what removes a coin for good.
             if visual
                 and visual:GetAttribute("Collected") ~= true
                 and isFiniteVector(coinPos) then
@@ -401,10 +419,10 @@ end
 local function collectCoin(coin)
     if not rootPart or not rootPart.Parent or not coin or not coin.Parent then return end
 
-    local visual = coin:FindFirstChild("CoinVisual")
+    local visual = coinVisual(coin)
 
     local targets = { coin }
-    if visual then table.insert(targets, visual) end
+    if visual ~= coin then table.insert(targets, visual) end
     if coin.Parent then table.insert(targets, coin.Parent) end
 
     pcall(function()
