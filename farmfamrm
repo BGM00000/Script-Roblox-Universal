@@ -5,23 +5,27 @@ if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
+
 -- ===========================================================================
---  MM2 coin farm
+--  MM2 coin farm -- v2
 --
---  What it does, and nothing else: find the closest coin, fly at it, take it,
---  and look again -- every single frame. If a coin closer than the current one
---  appears at any moment, the character turns toward it immediately, even mid
---  flight. The search is a full sphere around the character: above, below,
---  behind, every direction.
+--  What it does, in order: dismiss the device prompt, fly at the closest coin,
+--  take it through a touch, and look again. The closest coin is recomputed every
+--  single frame, so a coin that just spawned, or one that is closer than the one
+--  being flown at, takes over immediately.
 --
---  A few things are load-bearing and must not be "cleaned up":
+--  A coin is considered taken when it is no longer there. Nothing else decides:
+--  no timer, no confirmation, no blacklist. If a coin is still present, it is
+--  still a candidate and the character goes back to it.
+--
+--  Three things are load-bearing and must not be "cleaned up":
 --   * the character is moved by writing its CFrame. There is no physics
 --     actuator, because a velocity constraint fighting a teleport is what
 --     produces an impossible position and gets the client kicked (267).
 --   * collision is never switched back on while the character is standing
 --     inside the map: depenetration would launch it at enormous speed.
---     The next character is built with collision on anyway.
---   * a coin is only counted once the game confirms it is gone.
+--   * the closest coin is recomputed from the coin list every frame, and the
+--     list is kept current by the game's own add/remove signals.
 -- ===========================================================================
 
 local Players = game:GetService("Players")
@@ -42,19 +46,11 @@ local humanoid = character:WaitForChild("Humanoid")
 local remotes = ReplicatedStorage:WaitForChild("Remotes", 5)
 local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 
+
 -- ============================== SETTINGS ==============================
 local TARGET_SPEED       = 21     -- studs per second, and 21 is the ceiling:
                                   -- it keeps the flight smooth and readable
 local MAX_DIST           = 1000   -- radius of the sphere the search covers
-local COLLECT_RADIUS     = 2     -- the coin counts as reached this close, which
-                                  -- is all it takes: the character flies over it
-                                  -- and the coin is taken on the way past
-local RETARGET_BIAS      = 1    -- a coin must be this much closer to steal the
-                                  -- target, so two equal coins cannot make the
-                                  -- direction flip-flop every frame
-local RESET_DELAY        = 15     -- idle this long with no coin left, then reset
-local ANTI_FLING_MAX_SPEED = 14   -- above this a velocity is treated as a fling
-                                  -- and damped; well clear of TARGET_SPEED
 
 -- server hop
 local HOP_ENABLED          = true
@@ -68,49 +64,41 @@ local HOP_MAX_TRY_PER_PASS = 25
 -- servers are all full or all empty would otherwise be hopped at forever and
 -- never left. The console line before each sweep says what was available.
 local HOP_ALLOW_FALLBACK   = true
--- after a hop the game reloads, so the script must queue itself or the farm
--- stays dead there. queue_on_teleport needs the source, so the path on disk:
--- add yours here, or set getgenv().FarmScriptPath before running.
-local HOP_SELF_PATHS = { "famr.txt", "farm.txt", "farm.lua" }
+-- Deliberately no queue_on_teleport here: this script lives in the executor's
+-- auto-execute folder, so it comes back on its own after a hop. Queueing it as
+-- well would run two copies at once, both moving the character.
 -- ======================================================================
 
 -- options, all on by default
-local enabled          = true    -- auto farm
-local afkActive        = true    -- anti-AFK
-local antiFlingEnabled = true
-local antiFlingStrength = 1
-local lowRender        = true    -- draw nothing, save battery
+local enabled   = true    -- auto farm
+local afkActive = true    -- anti-AFK
+local lowRender = true    -- draw nothing, save battery
 
-local isLoaded         = false
-local bagIsFull        = false
-local isWaitingForCoins = false
-local showErrors       = false   -- was any frame error caught
+local isLoaded   = false
+local bagIsFull  = false
+local showErrors = false   -- did the last frame throw
 
 -- coins
-local activeCoins      = {}
-local blacklistedCoins = {}
-local currentTarget    = nil
-local noCoinsStartTime = nil
-local hasCollectedThisLife = false
-local coinsCollected   = 0
-local counterFromRemote = false  -- the game counts, not us
+local activeCoins       = {}
+local currentTarget     = nil
+local seenACoinThisLife = false
+local coinsCollected    = 0
 
 -- movement
-local heldCFrame       = nil     -- position held while waiting for a coin
-local virtualPos       = nil     -- position the character is heading to
-local lastGoodPosition = nil
+local heldCFrame = nil     -- position held while waiting for a coin
+local virtualPos = nil     -- position the character is heading to
 
 -- connections and loops
-local heartbeatConnection = nil
-local noclipConnection    = nil
+local heartbeatConnection      = nil
+local noclipConnection         = nil
 local characterChildConnection = nil
-local coinAddedConnection = nil
-local coinRemovedConnection = nil
-local coinsStartedConnection = nil
-local coinCollectedConnection = nil
-local bagWatcherThread    = nil
-local deviceSelectThread  = nil
-local hopThread           = nil
+local coinAddedConnection      = nil
+local coinRemovedConnection    = nil
+local coinsStartedConnection   = nil
+local coinCollectedConnection  = nil
+local antiAfkConnection        = nil
+local deviceSelectThread       = nil
+local hopThread                = nil
 local characterAddedConnection = nil
 
 -- server hop state
@@ -126,9 +114,10 @@ local hopDesc = nil
 
 local characterParts = {}
 
+
 -- ============================== HELPERS ==============================
 -- NaN is the thing that makes Roblox throw "Invalid position": a number that is
--- not a number, or an infinity, cannot be turned into a CFrame or a velocity.
+-- not a number, or an infinity, cannot be turned into a CFrame.
 local function isFiniteNumber(n)
     return type(n) == "number" and n == n and n ~= math.huge and n ~= -math.huge
 end
@@ -161,12 +150,27 @@ end
 -- Draw nothing but the interface. Big win on a phone, and the farm does not need
 -- visuals: it moves by coordinates and takes coins through touch events, so
 -- turning the 3D rendering off changes nothing about what it does.
--- Wrapped in a pcall because it is an executor-side capability: an executor
--- without it simply keeps rendering.
+--
+-- The frame cap follows it, since a picture nobody draws does not need frames:
+-- 20 while rendering is off, back to 60 the moment it returns. The farm is
+-- unaffected either way -- it travels at TARGET_SPEED per second, not per frame.
+--
+-- Both are executor-side capabilities, so both are wrapped: an executor without
+-- them simply keeps rendering, and keeps its own frame cap.
+local FPS_CAP_OFF = 20
+local FPS_CAP_ON  = 60
+
 local function setLowRender(state)
     lowRender = state and true or false
+
     pcall(function()
         RunService:Set3dRenderingEnabled(not lowRender)
+    end)
+
+    pcall(function()
+        local setFpsCap = getgenv().setfpscap or setfpscap
+        if type(setFpsCap) ~= "function" then return end
+        setFpsCap(lowRender and FPS_CAP_OFF or FPS_CAP_ON)
     end)
 end
 
@@ -193,14 +197,11 @@ local function stepTowards(targetPos, dt)
     -- an absolute position, not "current position + one step": with a relative
     -- move gravity adds up frame after frame and the character sinks through the
     -- map. Writing the intended position each frame wipes that drift out.
-    -- virtualPos is reset at every round start, so it can never be stale.
     if not virtualPos or not isFiniteVector(virtualPos) then
         virtualPos = rootPos
     end
 
     local direction = targetPos - virtualPos
-    if not isFiniteVector(direction) then return end
-
     local distance = direction.Magnitude
     if distance < 0.001 then return end
 
@@ -218,10 +219,11 @@ local function stepTowards(targetPos, dt)
     rootPart.AssemblyAngularVelocity = Vector3.zero
 end
 
+
 -- ============================== NOCLIP ==============================
 -- The parts of the character. Anything the game adds later (a tool, an
--- accessory, a pet) has to be picked up too, otherwise it is the one part that
--- still collides with the world.
+-- accessory) has to be picked up too, otherwise it is the one part that still
+-- collides with the world.
 local function refreshCharacterParts()
     characterParts = {}
     if not character then return end
@@ -248,38 +250,13 @@ local function watchCharacterParts()
     end)
 end
 
--- Anti-fling: refuse to carry an absurd velocity. A fling is nothing more than
--- somebody setting a huge velocity on your character, so damping it is the whole
--- defence. 100% wipes it out on the spot, less lets it bleed off over a few
--- frames. Never touches a velocity below ANTI_FLING_MAX_SPEED.
-local function applyAntiFling()
-    if not antiFlingEnabled then return end
-    if not rootPart or not rootPart.Parent then return end
-
-    local velocity = rootPart.AssemblyLinearVelocity
-    if not isFiniteVector(velocity) then
-        rootPart.AssemblyLinearVelocity = Vector3.zero
-    elseif velocity.Magnitude > ANTI_FLING_MAX_SPEED then
-        rootPart.AssemblyLinearVelocity = velocity * (1 - antiFlingStrength)
-    end
-
-    local spin = rootPart.AssemblyAngularVelocity
-    if not isFiniteVector(spin) then
-        rootPart.AssemblyAngularVelocity = Vector3.zero
-    elseif spin.Magnitude > ANTI_FLING_MAX_SPEED then
-        rootPart.AssemblyAngularVelocity = spin * (1 - antiFlingStrength)
-    end
-end
-
--- Noclip and anti-fling want the same thing on the same character at the same
--- moment, so they share one Stepped instead of each having their own.
 local function startNoclip()
     if noclipConnection then noclipConnection:Disconnect() end
     watchCharacterParts()
 
     noclipConnection = RunService.Stepped:Connect(function()
         if not character or not enabled or not humanoid or humanoid.Health <= 0 then return end
-        if bagIsFull or isWaitingForCoins then return end
+        if bagIsFull then return end
 
         for i = 1, #characterParts do
             local part = characterParts[i]
@@ -287,8 +264,6 @@ local function startNoclip()
                 part.CanCollide = false
             end
         end
-
-        applyAntiFling()
     end)
 
     if humanoid then
@@ -314,7 +289,7 @@ end
 -- the ejection into a gentle settle.
 local function restoreCollisionSafely()
     if rootPart and rootPart.Parent then
-        local base = lastGoodPosition or rootPart.Position
+        local base = rootPart.Position
         if isFiniteVector(base) then
             pcall(function()
                 rootPart.CFrame = CFrame.new(base + Vector3.new(0, 8, 0)) * currentRotation()
@@ -331,49 +306,55 @@ local function restoreCollisionSafely()
     end
 end
 
+
 -- ============================== ANTI-AFK ==============================
-local function antiAfkLoop()
-    while afkActive and enabled do
-        task.wait(30)
-        if not afkActive or not enabled then break end
+-- The plain one: the game says when the client has gone idle, and the click is
+-- only sent then. Nothing runs in the background and nothing is clicked while
+-- the player is active.
+local function startAntiAfk()
+    if antiAfkConnection then return end
+
+    antiAfkConnection = player.Idled:Connect(function()
+        if not afkActive then return end
         VirtualUser:CaptureController()
         VirtualUser:ClickButton2(Vector2.new())
-    end
+    end)
 end
+
 
 -- ============================== COINS ==============================
--- The event renames its pickups: at Halloween the coins become candy, so a part
--- called candy or candies is the same thing under another name.
-local function isCoin(part)
-    if not part:IsA("BasePart") or blacklistedCoins[part] then return false end
-    local name = part.Name:lower()
-    return name:find("coin") or name:find("candy") or name:find("candies")
-        or name:find("candie") or name:find("money") or name:find("collect")
-end
-
--- The part the game flags "Collected" and expects the touch on. It is CoinVisual
--- on a normal coin; a renamed pickup may well carry a renamed visual, so any
--- child with "visual" in its name is accepted, and the pickup itself is the last
--- resort -- a coin is never dropped for want of a correctly named child.
-local function coinVisual(coin)
-    local visual = coin:FindFirstChild("CoinVisual")
-    if visual then return visual end
-    for _, child in ipairs(coin:GetChildren()) do
-        if child:IsA("BasePart") and child.Name:lower():find("visual") then
-            return child
-        end
-    end
-    return coin
-end
-
--- The closest usable coin and its distance.
+-- The exact name of a coin, as the game really names it. The whole name is
+-- compared, not a piece of it: a filter on "coin" also catches a decoration, an
+-- accessory or a shop prop that merely contains the word -- and a decoration
+-- never disappears, so the character would fly at it forever.
 --
--- The distance is a plain 3D length between two positions, so the search is a
--- full sphere: above, below, behind, to the sides, all at once. Nothing filters
+-- If the name below is wrong, nothing breaks: the panel reads "No coins" and the
+-- character stays put. One line to change.
+local COIN_NAME = "CoinVisual"
+local COIN_KEY  = COIN_NAME:lower()   -- names are compared without their case
+
+local function isCoin(part)
+    if not part:IsA("BasePart") then return false end
+    return part.Name == COIN_NAME or part.Name:lower() == COIN_KEY
+end
+
+-- Is this coin still available? The only test is whether it is still there:
+-- gone, or flagged as collected by the game, means somebody else has it. A coin
+-- that is still present stays a candidate, even the one just flown over.
+local function coinIsAvailable(coin)
+    if not coin.Parent then return false end
+    if not isFiniteVector(coin.Position) then return false end
+    return coin:GetAttribute("Collected") ~= true
+end
+
+-- The closest available coin and its distance. This is the whole search: a plain
+-- 3D length between two positions, so it covers a full sphere around the
+-- character -- above, below, behind, to the sides, all at once. Nothing filters
 -- on height or direction. MAX_DIST is the radius of that sphere.
 --
 -- Called every frame, so a coin that appeared a moment ago is already a
 -- candidate, and a coin that is closer than the current target takes over.
+-- Coins that have gone are dropped from the list here.
 local function findNearestCoin(rootPos)
     local nearest = nil
     local nearestDist = MAX_DIST
@@ -381,22 +362,11 @@ local function findNearestCoin(rootPos)
     for coin in pairs(activeCoins) do
         if not coin.Parent then
             activeCoins[coin] = nil
-        else
-            local visual = coinVisual(coin)
-            local coinPos = coin.Position
-
-            -- skip anything unusable: already taken by someone else, or a
-            -- broken position. It stays in the list -- DescendantRemoving is
-            -- what removes a coin for good.
-            if visual
-                and visual:GetAttribute("Collected") ~= true
-                and isFiniteVector(coinPos) then
-
-                local dist = (coinPos - rootPos).Magnitude
-                if dist < nearestDist then
-                    nearest = coin
-                    nearestDist = dist
-                end
+        elseif coinIsAvailable(coin) then
+            local dist = (coin.Position - rootPos).Magnitude
+            if dist < nearestDist then
+                nearest = coin
+                nearestDist = dist
             end
         end
     end
@@ -404,63 +374,33 @@ local function findNearestCoin(rootPos)
     return nearest, nearestDist
 end
 
--- Takes one coin, from wherever the character happens to be: it flies over the
--- coin and every way the game might listen to a pickup is fired on the way past.
--- No teleport and no stopping -- the movement never pauses for a coin.
+-- Takes one coin, from wherever the character happens to be. No teleport and no
+-- stopping: the touches are fired from wherever it is while it flies over.
+-- Firing again on the next frame is harmless and is what gives a touch a second
+-- chance if the first one did not land.
 --
 -- A missing pickup is almost always a touch that went to the wrong part, or in
--- the wrong direction, so every plausible target is tried rather than betting on
--- one: the visual, the coin part itself, and whatever holds the coin -- which is
--- where the handler sits in some games. Each one is fired in both directions
--- (character -> coin and coin -> character) and as both a touch start and a
--- touch end, since some games only answer to one of the four.
--- The whole thing is in a pcall, and each event call is optional, so a coin can
--- never throw inside the frame loop.
+-- the wrong direction, so both plausible targets are tried rather than betting
+-- on one: the coin part itself, and whatever holds it. Each one is fired in both
+-- directions (character -> coin and coin -> character) and as both a touch start
+-- and a touch end, since some games only answer to one of the four.
+-- The whole thing is in a pcall, so a coin can never throw inside the frame loop.
 local function collectCoin(coin)
     if not rootPart or not rootPart.Parent or not coin or not coin.Parent then return end
 
-    local visual = coinVisual(coin)
-
-    local targets = { coin }
-    if visual ~= coin then table.insert(targets, visual) end
-    if coin.Parent then table.insert(targets, coin.Parent) end
+    local targets = { coin, coin.Parent }
 
     pcall(function()
-        if firetouchinterest then
-            for _, part in ipairs(targets) do
-                if part and part:IsA("BasePart") then
-                    firetouchinterest(rootPart, part, 0)
-                    firetouchinterest(rootPart, part, 1)
-                    -- the other way round: a few games check the part that is
-                    -- being touched rather than the one doing the touching
-                    firetouchinterest(part, rootPart, 0)
-                    firetouchinterest(part, rootPart, 1)
-                end
+        if not firetouchinterest then return end
+        for _, part in ipairs(targets) do
+            if part and part:IsA("BasePart") then
+                firetouchinterest(rootPart, part, 0)
+                firetouchinterest(rootPart, part, 1)
+                -- the other way round: a few games check the part that is being
+                -- touched rather than the one doing the touching
+                firetouchinterest(part, rootPart, 0)
+                firetouchinterest(part, rootPart, 1)
             end
-        end
-
-        -- the coin, its visual, or whatever holds it -- and if nothing there
-        -- carries the handler, anywhere inside them, since some games hang it a
-        -- level deeper
-        local function findIn(className)
-            for _, node in ipairs({ coin, visual, coin.Parent }) do
-                if node then
-                    local found = node:FindFirstChildOfClass(className)
-                        or node:FindFirstChildOfClass(className, true)
-                    if found then return found end
-                end
-            end
-            return nil
-        end
-
-        local clickDetector = findIn("ClickDetector")
-        if clickDetector and fireclickdetector then
-            fireclickdetector(clickDetector)
-        end
-
-        local prompt = findIn("ProximityPrompt")
-        if prompt and fireproximityprompt then
-            fireproximityprompt(prompt)
         end
     end)
 end
@@ -485,30 +425,6 @@ local function scanWorkspaceForCoins()
     end
 end
 
--- Does the game's own bag indicator say it is full?
-local function checkGuiBagFull()
-    local playerGui = player:FindFirstChild("PlayerGui")
-    if not playerGui then return false end
-
-    for _, gui in ipairs(playerGui:GetChildren()) do
-        if gui:IsA("ScreenGui") and gui.Name ~= "AutoFarmUI" then
-            local container = gui:FindFirstChild("Container", true)
-            if container then
-                for _, frame in ipairs(container:GetChildren()) do
-                    if frame:IsA("Frame") and frame.Visible then
-                        local fullIcon = frame:FindFirstChild("FullBagIcon", true)
-                        local fullText = frame:FindFirstChild("Full", true)
-                        if (fullIcon and fullIcon.Visible) or (fullText and fullText.Visible) then
-                            return true
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return false
-end
-
 local function triggerBagFullReset()
     if bagIsFull then return end
     bagIsFull = true
@@ -531,99 +447,78 @@ local function initCoinListeners()
     coinAddedConnection = Workspace.DescendantAdded:Connect(trackCoin)
     coinRemovedConnection = Workspace.DescendantRemoving:Connect(untrackCoin)
 
-    if not gameplayRemotes then return end
+    if not gameplayRemotes then
+        warn("[AutoFarm] gameplay remotes not found: the counter and the bag-full"
+            .. " check are unavailable, farming still works")
+        return
+    end
 
     local coinsStartedRemote = gameplayRemotes:WaitForChild("CoinsStarted", 5)
     local coinCollectedRemote = gameplayRemotes:WaitForChild("CoinCollected", 5)
 
     if coinsStartedRemote then
         coinsStartedConnection = coinsStartedRemote.OnClientEvent:Connect(function()
-            isWaitingForCoins = true
             stopMovement()
             currentTarget = nil
             activeCoins = {}
-            blacklistedCoins = {}
-            noCoinsStartTime = nil
             bagIsFull = false
-            -- forget everything we knew about where the character was: it is
-            -- about to be moved to a new map, and a remembered position from the
-            -- old one would drag it back across the place
+            -- forget where the character was: it is about to be moved to a new
+            -- map, and a remembered position from the old one would drag it back
+            -- across the place
             heldCFrame = nil
             virtualPos = nil
-            lastGoodPosition = nil
 
             scanWorkspaceForCoins()
-
-            isWaitingForCoins = false
         end)
     end
 
     if coinCollectedRemote then
-        -- The game announces every coin it banks. That is the honest source for
-        -- the counter: a touch that never landed cannot inflate it.
-        counterFromRemote = true
-
-        coinCollectedConnection = coinCollectedRemote.OnClientEvent:Connect(function(_, currentAmount, maxAmount)
+        -- The game announces every coin it banks, and passes its own running
+        -- count with it. That is the honest source for the counter -- a touch
+        -- that never landed cannot inflate it -- and it is also the exact moment
+        -- to ask about the bag, since this event fires when a coin has just been
+        -- taken and at no other time.
+        coinCollectedConnection = coinCollectedRemote.OnClientEvent:Connect(function(...)
             coinsCollected = coinsCollected + 1
-            hasCollectedThisLife = true
+            seenACoinThisLife = true
 
-            local current = tonumber(currentAmount)
-            local max = tonumber(maxAmount)
-            if current and max and current >= max then
+            local numbers = {}
+            for _, value in ipairs({ ... }) do
+                if type(value) == "number" then table.insert(numbers, value) end
+            end
+
+            local current = numbers[#numbers - 1]
+            local max = numbers[#numbers]
+            if current and max and max > 0 and current >= max then
                 triggerBagFullReset()
             end
         end)
     end
 end
 
--- the bag check walks the whole PlayerGui, so it stays on a slow side thread
-local function startBagWatcher()
-    if bagWatcherThread then task.cancel(bagWatcherThread) end
-
-    bagWatcherThread = task.spawn(function()
-        while isLoaded do
-            task.wait(0.25)
-            if enabled and not bagIsFull and checkGuiBagFull() then
-                triggerBagFullReset()
-            end
-        end
-    end)
-end
 
 -- ============================== DEVICE PROMPT ==============================
 -- The game asks which device you are on when you join, and the prompt sits over
 -- the screen until it is answered. It is dismissed for you, and re-checked once
 -- a second for as long as the button is there, since it comes back at the start
 -- of a round. Nothing happens when it is absent.
+local DEVICE_PATH = { "DeviceSelect", "Container", "Tablet", "Button" }
+
 local function findDeviceSelectButton()
     local playerGui = player:FindFirstChild("PlayerGui")
     if not playerGui then return nil end
 
-    local deviceSelect = playerGui:FindFirstChild("DeviceSelect")
-    if not deviceSelect or not deviceSelect.Enabled then return nil end
-
-    local container = deviceSelect:FindFirstChild("Container")
-    if not container or not container.Visible then return nil end
-
-    -- Tablet is the one this game uses; a sibling ("Phone", "Console") with its
-    -- own Button is accepted too, in case the prompt is renamed.
-    local candidates = { container:FindFirstChild("Tablet") }
-    for _, child in ipairs(container:GetChildren()) do
-        if child:IsA("GuiObject") and child.Name ~= "Tablet" then
-            table.insert(candidates, child)
-        end
+    local node = playerGui
+    for _, name in ipairs(DEVICE_PATH) do
+        node = node:FindFirstChild(name)
+        if not node then return nil end
     end
 
-    for _, frame in ipairs(candidates) do
-        if frame and frame.Visible then
-            local button = frame:FindFirstChild("Button")
-            if button and button.Visible then
-                return button
-            end
-        end
-    end
+    if not node.Visible then return nil end
+    local deviceSelect = node:FindFirstAncestorOfClass("ScreenGui")
+    if deviceSelect and not deviceSelect.Enabled then return nil end
 
-    return nil
+    return node
 end
 
 -- Our panel sits above everything and is hit-tested first, so a real click aimed
@@ -684,6 +579,7 @@ local function startDeviceSelectDismisser()
     end)
 end
 
+
 -- ============================== SERVER HOP ==============================
 -- Adapted from the hop section of mm2sniper.lua. The mechanism:
 --   * ask Roblox for the public server list of this place,
@@ -697,8 +593,14 @@ local function hopLog(message)
     print("[AutoFarm/hop] " .. tostring(message))
 end
 
+-- the servers closest to the wanted size first; among equals, the fullest
+local function serverOrder(a, b)
+    if a.off ~= b.off then return a.off < b.off end
+    return a.playing > b.playing
+end
+
 local function fetchServers(cursor)
-    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true")
+    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true")
         :format(game.PlaceId)
     if cursor and cursor ~= "" and cursor ~= "null" then
         url = url .. "&cursor=" .. cursor
@@ -760,10 +662,7 @@ local function fetchServers(cursor)
         end
     end
 
-    table.sort(servers, function(a, b)
-        if a.off ~= b.off then return a.off < b.off end
-        return a.playing > b.playing
-    end)
+    table.sort(servers, serverOrder)
 
     local nextCursor = decoded.nextPageCursor
     if nextCursor == "null" then nextCursor = nil end
@@ -800,41 +699,6 @@ local function tryTeleportTo(server)
     if not failed then return true end
 
     hopLog("Teleport refused: " .. tostring(failResult))
-    return false
-end
-
--- Queues this script to run again after the teleport, or the farm stays dead on
--- the new server. Useful only once per hop: queueing on every attempt stacks a
--- copy of the script per refused server, and they all run at once afterwards.
-local function tryQueueSelf()
-    local queue = getgenv().queue_on_teleport or queue_on_teleport
-    if type(queue) ~= "function" then
-        hopLog("queue_on_teleport unavailable -> restart the script by hand after a hop")
-        return false
-    end
-
-    local paths = {}
-    local custom = getgenv().FarmScriptPath
-    if type(custom) == "string" and custom ~= "" then
-        table.insert(paths, custom)
-    end
-    for _, path in ipairs(HOP_SELF_PATHS) do
-        table.insert(paths, path)
-    end
-
-    for _, path in ipairs(paths) do
-        local ok, content = pcall(function()
-            if isfile and isfile(path) then return readfile(path) end
-            return nil
-        end)
-        if ok and content and #content > 200 then
-            pcall(queue, content)
-            hopLog("Script queued to re-run from " .. path)
-            return true
-        end
-    end
-
-    hopLog("Could not read the script from disk -> set getgenv().FarmScriptPath to its path")
     return false
 end
 
@@ -893,10 +757,7 @@ local function serverHop()
 
         -- pages are appended one after another, so the collected list is not
         -- sorted as a whole
-        table.sort(nearest, function(a, b)
-            if a.off ~= b.off then return a.off < b.off end
-            return a.playing > b.playing
-        end)
+        table.sort(nearest, serverOrder)
 
         -- what the game actually offers, so an unreachable band is obvious
         if #inBand == 0 then
@@ -965,6 +826,7 @@ local function startHopTimer()
     end)
 end
 
+
 -- ============================== FARM LOOP ==============================
 local function cleanupConnections()
     if heartbeatConnection then heartbeatConnection:Disconnect() heartbeatConnection = nil end
@@ -977,91 +839,49 @@ local function cleanupConnections()
 end
 
 local function updateFarm(dt)
-    dt = dt or 0.016
-
     if not enabled or not rootPart or not rootPart.Parent or not humanoid or humanoid.Health <= 0 then
         stopMovement()
         return
     end
 
-    -- bag full (about to die) and round changes: the game is moving the
-    -- character then, so we keep our hands off it
-    if bagIsFull or isWaitingForCoins then
+    -- the bag is full: the game is about to move the character, so we keep our
+    -- hands off it
+    if bagIsFull then
         stopMovement()
         return
     end
 
     local rootPos = rootPart.Position
 
-    -- a position that has gone to nonsense (NaN or infinity): put the character
-    -- back on the last spot we know was good, and stop for this frame. Killing
-    -- here would turn a bad frame into a respawn loop.
-    if not isFiniteVector(rootPos) then
-        stopMovement()
-        if lastGoodPosition then
-            pcall(function()
-                rootPart.CFrame = CFrame.new(lastGoodPosition) * currentRotation()
-            end)
-        end
-        return
-    end
-    lastGoodPosition = rootPos
-
-    -- the closest coin, recomputed every frame -- a coin that just appeared, or
-    -- one closer than the current target, takes over immediately
-    local nearest, nearestDist = findNearestCoin(rootPos)
-
-    -- keep the current target only while nothing meaningfully closer shows up
-    if nearest and currentTarget and currentTarget.Parent and not blacklistedCoins[currentTarget]
-        and isFiniteVector(currentTarget.Position) then
-        local currentDist = (currentTarget.Position - rootPos).Magnitude
-        if currentDist > COLLECT_RADIUS and currentDist <= nearestDist + RETARGET_BIAS then
-            nearest = currentTarget
-            nearestDist = currentDist
-        end
-    end
+    -- the closest available coin, recomputed every frame. A coin taken by
+    -- someone else is simply not there any more and drops out; a new one is a
+    -- candidate the moment it exists.
+    local nearest = findNearestCoin(rootPos)
     currentTarget = nearest
 
-    if not currentTarget then
-        -- no coin to go to. Once a coin has been collected this life we are
-        -- inside the round, so hold still and wait; before that we are still in
-        -- the lobby and the game is about to move us itself.
-        if hasCollectedThisLife then
+    if not nearest then
+        -- nothing to go to. Once a coin has been seen this life we are inside
+        -- the round, so hold still and wait for the next one; before that we are
+        -- still in the lobby and the game is about to move us itself.
+        if seenACoinThisLife then
             holdPosition()
-
-            if not noCoinsStartTime then
-                noCoinsStartTime = os.clock()
-            elseif os.clock() - noCoinsStartTime >= RESET_DELAY then
-                noCoinsStartTime = nil
-                cleanupConnections()
-                humanoid.Health = 0
-            end
         else
             stopMovement()
         end
         return
     end
 
-    noCoinsStartTime = nil
+    seenACoinThisLife = true
 
-    -- close enough: take it and keep flying. No stop, no teleport -- the address
-    -- of the coin is never even used, the touch is fired from where the character
-    -- happens to be.
-    if nearestDist <= COLLECT_RADIUS then
-        collectCoin(nearest)
-        -- set aside on the spot: the very next frame is already picking the
-        -- coin after it, so the character flies over a coin and never turns back
-        -- for it. No waiting, no timer, nothing to confirm.
-        blacklistedCoins[nearest] = true
-        activeCoins[nearest] = nil
-        hasCollectedThisLife = true
-        currentTarget = nil
-        noCoinsStartTime = nil
-        -- no remote to count with, so the touch is the only evidence there is
-        if not counterFromRemote then
-            coinsCollected = coinsCollected + 1
-        end
-    end
+    -- fire at it and keep flying, and there is no distance to wait for: as soon
+    -- as the coin is the target the shots start, and they keep coming every frame
+    -- until it is gone. The flight never stops, and the next coin takes over the
+    -- instant this one disappears.
+    --
+    -- A shot fired from far away is ignored by the game and costs nothing: the
+    -- character is still closing in, and the next frame fires again, from closer.
+    -- That is why no radius is needed here at all.
+    collectCoin(nearest)
 
     stepTowards(nearest.Position, dt)
 end
@@ -1069,8 +889,6 @@ end
 local function startMovementEngine()
     cleanupConnections()
     initCoinListeners()
-    noCoinsStartTime = nil
-    lastGoodPosition = nil
     heldCFrame = nil
     virtualPos = nil
     showErrors = false
@@ -1081,7 +899,9 @@ local function startMovementEngine()
     -- the first error
     heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
         local ok, err = pcall(updateFarm, dt)
-        if not ok then
+        if ok then
+            showErrors = false
+        else
             showErrors = true
             warn("[AutoFarm] " .. tostring(err))
             stopMovement()
@@ -1094,27 +914,27 @@ local function unloadScript()
     enabled = false
     afkActive = false
     bagIsFull = false
-    isWaitingForCoins = false
 
     cleanupConnections()
     stopNoclip()
     restoreCollisionSafely()
     setLowRender(false)
 
-    if bagWatcherThread then task.cancel(bagWatcherThread) bagWatcherThread = nil end
     -- these loops stop on their own, isLoaded is already false
     deviceSelectThread = nil
     hopThread = nil
 
+    if antiAfkConnection then
+        antiAfkConnection:Disconnect()
+        antiAfkConnection = nil
+    end
     if characterAddedConnection then
         characterAddedConnection:Disconnect()
         characterAddedConnection = nil
     end
 
     activeCoins = {}
-    blacklistedCoins = {}
     currentTarget = nil
-    lastGoodPosition = nil
     heldCFrame = nil
     virtualPos = nil
 end
@@ -1123,18 +943,14 @@ local function loadScript()
     if isLoaded then unloadScript() end
     isLoaded = true
     bagIsFull = false
-    isWaitingForCoins = false
 
     character = player.Character or player.CharacterAdded:Wait()
     rootPart = character:WaitForChild("HumanoidRootPart")
     humanoid = character:WaitForChild("Humanoid")
 
-    blacklistedCoins = {}
-    noCoinsStartTime = nil
-    hasCollectedThisLife = false
+    seenACoinThisLife = false
     coinsCollected = 0
 
-    startBagWatcher()
     startMovementEngine()
     startDeviceSelectDismisser()
     startHopTimer()
@@ -1148,12 +964,8 @@ local function loadScript()
         rootPart = character:WaitForChild("HumanoidRootPart")
         humanoid = character:WaitForChild("Humanoid")
 
-        blacklistedCoins = {}
-        noCoinsStartTime = nil
-        hasCollectedThisLife = false
+        seenACoinThisLife = false
         bagIsFull = false
-        isWaitingForCoins = false
-        lastGoodPosition = nil
         heldCFrame = nil
         virtualPos = nil
         -- the new character is a fresh model with collision on by itself, so
@@ -1165,6 +977,7 @@ local function loadScript()
         end
     end)
 end
+
 
 -- ============================== INTERFACE ==============================
 -- One quiet column: labels left, controls right, hairline rules between groups.
@@ -1195,8 +1008,8 @@ ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.DisplayOrder = 2147483647   -- over every other interface
 
 Main = Instance.new("Frame")
-Main.Size = UDim2.new(0, 272, 0, 436)
-Main.Position = UDim2.new(0.5, -136, 0.5, -218)
+Main.Size = UDim2.new(0, 272, 0, 356)
+Main.Position = UDim2.new(0.5, -136, 0.5, -178)
 Main.BackgroundColor3 = C_BG
 Main.BorderSizePixel = 0
 Main.Parent = ScreenGui
@@ -1217,7 +1030,6 @@ local function divider(y)
     line.BackgroundColor3 = C_LINE
     line.BorderSizePixel = 0
     line.Parent = Main
-    return line
 end
 
 -- ---------------------------------- header ----------------------------------
@@ -1378,163 +1190,50 @@ local function createRow(y, labelText, descText, initial, callback)
     return row, desc
 end
 
--- ---------------------------------- slider ----------------------------------
--- The whole strip is draggable, not just the knob, so one click anywhere sets it.
-local function createSlider(y, labelText, initial, onChanged)
-    local holder = Instance.new("Frame")
-    holder.Size = UDim2.new(1, -12, 0, 34)
-    holder.Position = UDim2.new(0, 6, 0, y)
-    holder.BackgroundTransparency = 1
-    holder.Parent = Main
-
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(0, 150, 0, 13)
-    label.Position = UDim2.new(0, 10, 0, 1)
-    label.BackgroundTransparency = 1
-    label.Text = labelText
-    label.TextColor3 = C_DIM
-    label.Font = F_TEXT
-    label.TextSize = 11
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Parent = holder
-
-    local valueLabel = Instance.new("TextLabel")
-    valueLabel.Size = UDim2.new(0, 70, 0, 13)
-    valueLabel.Position = UDim2.new(1, -80, 0, 1)
-    valueLabel.BackgroundTransparency = 1
-    valueLabel.Text = ""
-    valueLabel.TextColor3 = C_TEXT
-    valueLabel.Font = F_NUM
-    valueLabel.TextSize = 11
-    valueLabel.TextXAlignment = Enum.TextXAlignment.Right
-    valueLabel.Parent = holder
-
-    local hit = Instance.new("TextButton")
-    hit.Size = UDim2.new(1, -20, 0, 16)
-    hit.Position = UDim2.new(0, 10, 0, 17)
-    hit.BackgroundTransparency = 1
-    hit.Text = ""
-    hit.AutoButtonColor = false
-    hit.BorderSizePixel = 0
-    hit.Parent = holder
-
-    local rail = Instance.new("Frame")
-    rail.Size = UDim2.new(1, -12, 0, 2)
-    rail.Position = UDim2.new(0, 6, 0.5, -1)
-    rail.BackgroundColor3 = C_LINE
-    rail.BorderSizePixel = 0
-    rail.Parent = hit
-
-    local fill = Instance.new("Frame")
-    fill.Size = UDim2.new(initial, 0, 1, 0)
-    fill.BackgroundColor3 = C_ACCENT
-    fill.BorderSizePixel = 0
-    fill.Parent = rail
-
-    local knob = Instance.new("Frame")
-    knob.Size = UDim2.new(0, 10, 0, 10)
-    knob.Position = UDim2.new(initial, -5, 0.5, -5)
-    knob.BackgroundColor3 = C_ACCENT
-    knob.BorderSizePixel = 0
-    knob.Parent = hit
-
-    local knobCorner = Instance.new("UICorner")
-    knobCorner.CornerRadius = UDim.new(0, 2)
-    knobCorner.Parent = knob
-
-    local fraction = initial
-
-    local function apply(newFraction, notify)
-        fraction = math.clamp(newFraction, 0, 1)
-        fill.Size = UDim2.new(fraction, 0, 1, 0)
-        knob.Position = UDim2.new(fraction, -5, 0.5, -5)
-        valueLabel.Text = string.format("%d%%", math.floor(fraction * 100 + 0.5))
-        if notify then onChanged(fraction) end
-    end
-
-    apply(fraction, false)
-
-    local sliding = false
-    local function setFromScreenX(x)
-        local width = hit.AbsoluteSize.X
-        if width <= 0 then return end
-        apply((x - hit.AbsolutePosition.X) / width, true)
-    end
-
-    hit.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            sliding = true
-            setFromScreenX(input.Position.X)
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if not sliding then return end
-        if input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch then
-            setFromScreenX(input.Position.X)
-        end
-    end)
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            sliding = false
-        end
-    end)
-end
-
 -- ---------------------------------- layout ----------------------------------
 divider(44)
 
 createRow(45, "Auto farm", "Always the closest coin", true, function(state)
     enabled = state
     if state then
-        if not isLoaded then loadScript() end
-        startMovementEngine()
-        if afkActive then task.spawn(antiAfkLoop) end
+        if not isLoaded then
+            loadScript()
+        else
+            startMovementEngine()
+        end
     else
         stopMovement()
         stopNoclip()
-        noCoinsStartTime = nil
     end
 end)
 
-createRow(91, "Anti-AFK", "Keeps the session from idling out", true, function(state)
+createRow(91, "Anti-AFK", "Clicks back when the game says it is idle", true, function(state)
     afkActive = state
-    if state and enabled then task.spawn(antiAfkLoop) end
 end)
 
 divider(137)
 
-createRow(138, "Anti-fling", "Refuses a huge velocity", true, function(state)
-    antiFlingEnabled = state
-end)
-
-createSlider(184, "Fling resistance", antiFlingStrength, function(value)
-    antiFlingStrength = value
-end)
-
-createRow(218, "Low render", "Draws nothing, saves battery", true, function(state)
+createRow(138, "Low render", "Draws nothing, saves battery", true, function(state)
     setLowRender(state)
 end)
 
-divider(264)
+divider(184)
 
 -- the description line of this row is taken over by the countdown
-local _, hopDescLabel = createRow(265, "Server hop", "Every 60 min", HOP_ENABLED, function(state)
+local _, hopDescLabel = createRow(185, "Server hop", "Every 60 min", HOP_ENABLED, function(state)
     HOP_ENABLED = state
     if state then farmTime = 0 end
 end)
 hopDesc = hopDescLabel
 
-divider(311)
+divider(231)
 
 -- ------------------------------ hop button ------------------------------
 -- Leaves for another server on demand, instead of waiting out the countdown.
 -- Useful to test the hop, and to leave a server that has turned bad.
 local HopBtn = Instance.new("TextButton")
 HopBtn.Size = UDim2.new(1, -12, 0, 26)
-HopBtn.Position = UDim2.new(0, 6, 0, 312)
+HopBtn.Position = UDim2.new(0, 6, 0, 232)
 HopBtn.BackgroundColor3 = C_PANEL
 HopBtn.BackgroundTransparency = 0.35
 HopBtn.Text = "Hop now"
@@ -1566,12 +1265,12 @@ HopBtn.MouseButton1Click:Connect(function()
     task.spawn(serverHop)
 end)
 
-divider(343)
+divider(263)
 
 -- ------------------------------ total coins ------------------------------
 -- The game's own balance, read from its shop interface. That is the running
--- total across every round and every server -- something the session counter
--- in the readout below cannot show.
+-- total across every round and every server -- something the session counter in
+-- the readout below cannot show.
 local function findShopAmount()
     local playerGui = player:FindFirstChild("PlayerGui")
     if not playerGui then return nil end
@@ -1601,7 +1300,7 @@ end
 
 local TotalLabel = Instance.new("TextLabel")
 TotalLabel.Size = UDim2.new(0, 110, 0, 16)
-TotalLabel.Position = UDim2.new(0, 12, 0, 345)
+TotalLabel.Position = UDim2.new(0, 12, 0, 265)
 TotalLabel.BackgroundTransparency = 1
 TotalLabel.Text = "Total coins"
 TotalLabel.TextColor3 = C_DIM
@@ -1612,7 +1311,7 @@ TotalLabel.Parent = Main
 
 local TotalValue = Instance.new("TextLabel")
 TotalValue.Size = UDim2.new(0, 130, 0, 16)
-TotalValue.Position = UDim2.new(1, -142, 0, 345)
+TotalValue.Position = UDim2.new(1, -142, 0, 265)
 TotalValue.BackgroundTransparency = 1
 TotalValue.Text = "—"
 TotalValue.TextColor3 = C_TEXT
@@ -1621,14 +1320,14 @@ TotalValue.TextSize = 13
 TotalValue.TextXAlignment = Enum.TextXAlignment.Right
 TotalValue.Parent = Main
 
-divider(371)
+divider(291)
 
 -- ---------------------------------- readout ----------------------------------
 -- The one loud element: how many coins taken, how far the next one is, and a bar
 -- that fills as the character closes in.
 local Readout = Instance.new("Frame")
 Readout.Size = UDim2.new(1, -32, 0, 58)
-Readout.Position = UDim2.new(0, 16, 0, 374)
+Readout.Position = UDim2.new(0, 16, 0, 294)
 Readout.BackgroundTransparency = 1
 Readout.Parent = Main
 
@@ -1701,9 +1400,11 @@ task.spawn(function()
         task.wait(0.15)
 
         local dist = nil
-        if currentTarget and currentTarget.Parent and rootPart and rootPart.Parent
-            and isFiniteVector(currentTarget.Position - rootPart.Position) then
-            dist = (currentTarget.Position - rootPart.Position).Magnitude
+        if currentTarget and currentTarget.Parent and rootPart and rootPart.Parent then
+            local diff = currentTarget.Position - rootPart.Position
+            if isFiniteVector(diff) then
+                dist = diff.Magnitude
+            end
         end
 
         CoinsValue.Text = tostring(coinsCollected)
@@ -1715,10 +1416,10 @@ task.spawn(function()
         refreshShopAmount()
         TotalValue.Text = shopAmountLabel and shopAmountLabel.Text or "—"
 
+        -- written directly: the whole display already refreshes faster than a
+        -- tween would run, so one would only add work
         local fraction = dist and math.clamp(1 - dist / GAUGE_RANGE, 0, 1) or 0
-        TweenService:Create(GaugeFill, TweenInfo.new(0.15, Enum.EasingStyle.Linear), {
-            Size = UDim2.new(fraction, 0, 1, 0),
-        }):Play()
+        GaugeFill.Size = UDim2.new(fraction, 0, 1, 0)
 
         -- the button says what it is doing, so a click that seems to do nothing
         -- is explained
@@ -1746,8 +1447,6 @@ task.spawn(function()
             setState("Idle", C_DIM)
         elseif bagIsFull then
             setState("Bag full", C_WARN)
-        elseif isWaitingForCoins then
-            setState("Waiting", C_DIM)
         elseif dist then
             setState("Farming", C_ON)
         else
@@ -1785,4 +1484,4 @@ end)
 -- ============================== START ==============================
 -- everything starts on, so the farm is already running when the panel appears
 loadScript()
-if afkActive then task.spawn(antiAfkLoop) end
+startAntiAfk()
