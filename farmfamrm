@@ -157,7 +157,7 @@ end
 --
 -- Both are executor-side capabilities, so both are wrapped: an executor without
 -- them simply keeps rendering, and keeps its own frame cap.
-local FPS_CAP_OFF = 20
+local FPS_CAP_OFF = 40
 local FPS_CAP_ON  = 60
 
 local function setLowRender(state)
