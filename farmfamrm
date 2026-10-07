@@ -55,8 +55,8 @@ local MAX_DIST           = 1000   -- radius of the sphere the search covers
 -- server hop
 local HOP_ENABLED          = true
 local HOP_AFTER            = 60 * 60  -- seconds of real farming before leaving
-local HOP_MIN_PLAYERS      = 3
-local HOP_MAX_PLAYERS      = 7
+local HOP_MIN_PLAYERS      = 5
+local HOP_MAX_PLAYERS      = 9
 local HOP_PAGES            = 4
 local HOP_RETRY_DELAY      = 10
 local HOP_MAX_TRY_PER_PASS = 25
@@ -600,7 +600,7 @@ local function serverOrder(a, b)
 end
 
 local function fetchServers(cursor)
-    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100&excludeFullGames=true")
+    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true")
         :format(game.PlaceId)
     if cursor and cursor ~= "" and cursor ~= "null" then
         url = url .. "&cursor=" .. cursor
@@ -826,6 +826,23 @@ local function startHopTimer()
     end)
 end
 
+-- One player in the server is one too few: no round ever starts. It is checked
+-- on its own slow loop, and it hands over to exactly the same hop the countdown
+-- uses.
+local function startAloneWatch()
+    task.spawn(function()
+        while isLoaded do
+            task.wait(10)
+            if HOP_ENABLED and enabled and not hopRunning
+                and #Players:GetPlayers() <= 1 then
+                hopLog("Alone in this server -> hopping out")
+                farmTime = 0
+                task.spawn(serverHop)
+            end
+        end
+    end)
+end
+
 
 -- ============================== FARM LOOP ==============================
 local function cleanupConnections()
@@ -954,6 +971,7 @@ local function loadScript()
     startMovementEngine()
     startDeviceSelectDismisser()
     startHopTimer()
+    startAloneWatch()
     setLowRender(lowRender)
 
     if characterAddedConnection then characterAddedConnection:Disconnect() end
