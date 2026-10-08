@@ -1480,3 +1480,4 @@ end)
 -- everything starts on, so the farm is already running when the panel appears
 loadScript()
 startAntiAfk()
+
