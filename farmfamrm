@@ -151,26 +151,13 @@ end
 -- visuals: it moves by coordinates and takes coins through touch events, so
 -- turning the 3D rendering off changes nothing about what it does.
 --
--- The frame cap follows it, since a picture nobody draws does not need frames:
--- 20 while rendering is off, back to 60 the moment it returns. The farm is
--- unaffected either way -- it travels at TARGET_SPEED per second, not per frame.
---
--- Both are executor-side capabilities, so both are wrapped: an executor without
--- them simply keeps rendering, and keeps its own frame cap.
-local FPS_CAP_OFF = 60
-local FPS_CAP_ON  = 60
-
+-- This is an executor-side capability, so it is wrapped: an executor without it
+-- simply keeps rendering.
 local function setLowRender(state)
     lowRender = state and true or false
 
     pcall(function()
         RunService:Set3dRenderingEnabled(not lowRender)
-    end)
-
-    pcall(function()
-        local setFpsCap = getgenv().setfpscap or setfpscap
-        if type(setFpsCap) ~= "function" then return end
-        setFpsCap(lowRender and FPS_CAP_OFF or FPS_CAP_ON)
     end)
 end
 
@@ -338,19 +325,19 @@ local function isCoin(part)
     return part.Name == COIN_NAME or part.Name:lower() == COIN_KEY
 end
 
--- Is this coin still available? The only test is whether it is still there:
--- gone, or flagged as collected by the game, means somebody else has it. A coin
+-- Is this coin still available? A coin whose part is gone is dropped by the
+-- caller before it gets here; what is left is a coin the game has flagged as
+-- collected -- somebody else has it -- or one with a broken position. A coin
 -- that is still present stays a candidate, even the one just flown over.
 local function coinIsAvailable(coin)
-    if not coin.Parent then return false end
     if not isFiniteVector(coin.Position) then return false end
     return coin:GetAttribute("Collected") ~= true
 end
 
--- The closest available coin and its distance. This is the whole search: a plain
--- 3D length between two positions, so it covers a full sphere around the
--- character -- above, below, behind, to the sides, all at once. Nothing filters
--- on height or direction. MAX_DIST is the radius of that sphere.
+-- The closest available coin. This is the whole search: a plain 3D length between
+-- two positions, so it covers a full sphere around the character -- above, below,
+-- behind, to the sides, all at once. Nothing filters on height or direction.
+-- MAX_DIST is the radius of that sphere.
 --
 -- Called every frame, so a coin that appeared a moment ago is already a
 -- candidate, and a coin that is closer than the current target takes over.
@@ -371,7 +358,7 @@ local function findNearestCoin(rootPos)
         end
     end
 
-    return nearest, nearestDist
+    return nearest
 end
 
 -- Takes one coin, from wherever the character happens to be. No teleport and no
@@ -386,7 +373,7 @@ end
 -- and a touch end, since some games only answer to one of the four.
 -- The whole thing is in a pcall, so a coin can never throw inside the frame loop.
 local function collectCoin(coin)
-    if not rootPart or not rootPart.Parent or not coin or not coin.Parent then return end
+    if not rootPart or not rootPart.Parent or not coin.Parent then return end
 
     local targets = { coin, coin.Parent }
 
@@ -435,7 +422,6 @@ local function triggerBagFullReset()
     -- It dies in a moment and the next character has collision on by itself.
     stopNoclip()
 
-    task.wait(0.2)
     if humanoid and humanoid.Health > 0 then
         humanoid.Health = 0
     end
@@ -458,15 +444,13 @@ local function initCoinListeners()
 
     if coinsStartedRemote then
         coinsStartedConnection = coinsStartedRemote.OnClientEvent:Connect(function()
+            -- stopMovement also forgets where the character was, which matters
+            -- here: it is about to be moved to a new map, and a remembered
+            -- position from the old one would drag it back across the place
             stopMovement()
             currentTarget = nil
             activeCoins = {}
             bagIsFull = false
-            -- forget where the character was: it is about to be moved to a new
-            -- map, and a remembered position from the old one would drag it back
-            -- across the place
-            heldCFrame = nil
-            virtualPos = nil
 
             scanWorkspaceForCoins()
         end)
@@ -949,11 +933,6 @@ local function unloadScript()
         characterAddedConnection:Disconnect()
         characterAddedConnection = nil
     end
-
-    activeCoins = {}
-    currentTarget = nil
-    heldCFrame = nil
-    virtualPos = nil
 end
 
 local function loadScript()
@@ -1445,18 +1424,16 @@ task.spawn(function()
         HopBtn.TextColor3 = hopRunning and C_DIM or C_TEXT
 
         -- the hop row doubles as a countdown
-        if hopDesc then
-            if not HOP_ENABLED then
-                hopDesc.Text = "Off"
-            elseif hopRunning then
-                hopDesc.Text = "Looking for a smaller server"
-            elseif not enabled then
-                hopDesc.Text = string.format("Paused · %d min", math.floor(farmTime / 60))
-            else
-                local remaining = math.max(0, HOP_AFTER - farmTime)
-                hopDesc.Text = string.format("Next in %dm %02ds",
-                    math.floor(remaining / 60), math.floor(remaining % 60))
-            end
+        if not HOP_ENABLED then
+            hopDesc.Text = "Off"
+        elseif hopRunning then
+            hopDesc.Text = "Looking for a smaller server"
+        elseif not enabled then
+            hopDesc.Text = string.format("Paused · %d min", math.floor(farmTime / 60))
+        else
+            local remaining = math.max(0, HOP_AFTER - farmTime)
+            hopDesc.Text = string.format("Next in %dm %02ds",
+                math.floor(remaining / 60), math.floor(remaining % 60))
         end
 
         if showErrors then
