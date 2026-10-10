@@ -81,15 +81,16 @@ local showErrors = false   -- did the last frame throw
 -- coins
 local activeCoins       = {}
 local currentTarget     = nil
+local seenACoinThisLife = false
 local coinsCollected    = 0
 
 -- movement
+local heldCFrame = nil     -- position held while waiting for a coin
 local virtualPos = nil     -- position the character is heading to
 
 -- connections and loops
 local heartbeatConnection      = nil
 local noclipConnection         = nil
-local noclipping               = false   -- is the character noclipping right now
 local characterChildConnection = nil
 local coinAddedConnection      = nil
 local coinRemovedConnection    = nil
@@ -138,6 +139,7 @@ local function currentRotation()
 end
 
 local function stopMovement()
+    heldCFrame = nil
     virtualPos = nil
     if rootPart then
         rootPart.AssemblyLinearVelocity = Vector3.zero
@@ -157,6 +159,19 @@ local function setLowRender(state)
     pcall(function()
         RunService:Set3dRenderingEnabled(not lowRender)
     end)
+end
+
+-- Between two coins the character has nothing to stand on (noclip), so it would
+-- slowly sink through the map. Putting its own CFrame back every frame keeps it
+-- exactly where it is, with nothing physical involved.
+local function holdPosition()
+    if not rootPart or not rootPart.Parent then return end
+    virtualPos = nil
+
+    if not heldCFrame then heldCFrame = rootPart.CFrame end
+    rootPart.CFrame = heldCFrame
+    rootPart.AssemblyLinearVelocity = Vector3.zero
+    rootPart.AssemblyAngularVelocity = Vector3.zero
 end
 
 -- one frame of travel toward a position, written directly.
@@ -185,6 +200,7 @@ local function stepTowards(targetPos, dt)
     if not isFiniteVector(newPos) then return end
 
     virtualPos = newPos
+    heldCFrame = nil
     rootPart.CFrame = CFrame.new(newPos) * currentRotation()
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
@@ -221,6 +237,37 @@ local function watchCharacterParts()
     end)
 end
 
+local function startNoclip()
+    if noclipConnection then noclipConnection:Disconnect() end
+    watchCharacterParts()
+
+    noclipConnection = RunService.Stepped:Connect(function()
+        if not character or not enabled or not humanoid or humanoid.Health <= 0 then return end
+        if bagIsFull then return end
+
+        for i = 1, #characterParts do
+            local part = characterParts[i]
+            if part and part.Parent and part.CanCollide then
+                part.CanCollide = false
+            end
+        end
+    end)
+
+    if humanoid then
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
+    end
+end
+
+local function stopNoclip()
+    if noclipConnection then
+        noclipConnection:Disconnect()
+        noclipConnection = nil
+    end
+end
+
 -- Put collision back, carefully. The character has spent the whole round
 -- noclipping, so it is usually standing inside a wall or under the floor, and
 -- switching CanCollide on right there makes Roblox depenetrate it -- a body
@@ -243,52 +290,6 @@ local function restoreCollisionSafely()
         if part and part.Parent then
             part.CanCollide = true
         end
-    end
-end
-
--- Noclip is only ever on while there is a coin to fly at. The rest of the time
--- the character is handed back to the game completely untouched -- collision on,
--- gravity on, nothing written to it -- and just stands there like any other
--- player until a coin shows up.
-local function startNoclip()
-    if noclipConnection then noclipConnection:Disconnect() end
-    watchCharacterParts()
-
-    noclipConnection = RunService.Stepped:Connect(function()
-        -- dead, or the round is being reset: the character is about to be
-        -- replaced, and the next one comes with collision on by itself
-        if not character or not humanoid or humanoid.Health <= 0 or bagIsFull then
-            noclipping = false
-            return
-        end
-
-        if enabled and currentTarget then
-            noclipping = true
-            for i = 1, #characterParts do
-                local part = characterParts[i]
-                if part and part.Parent and part.CanCollide then
-                    part.CanCollide = false
-                end
-            end
-        elseif noclipping then
-            -- nothing to farm any more: hand the character back
-            noclipping = false
-            restoreCollisionSafely()
-        end
-    end)
-
-    if humanoid then
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
-    end
-end
-
-local function stopNoclip()
-    if noclipConnection then
-        noclipConnection:Disconnect()
-        noclipConnection = nil
     end
 end
 
@@ -463,6 +464,7 @@ local function initCoinListeners()
         -- taken and at no other time.
         coinCollectedConnection = coinCollectedRemote.OnClientEvent:Connect(function(...)
             coinsCollected = coinsCollected + 1
+            seenACoinThisLife = true
 
             local numbers = {}
             for _, value in ipairs({ ... }) do
@@ -838,15 +840,7 @@ local function cleanupConnections()
 end
 
 local function updateFarm(dt)
-    -- switched off: the character belongs to the game again, so nothing is
-    -- written to it. Only the flight memory is dropped, or the next coin would
-    -- be flown to from wherever the character used to be.
-    if not enabled then
-        virtualPos = nil
-        return
-    end
-
-    if not rootPart or not rootPart.Parent or not humanoid or humanoid.Health <= 0 then
+    if not enabled or not rootPart or not rootPart.Parent or not humanoid or humanoid.Health <= 0 then
         stopMovement()
         return
     end
@@ -867,14 +861,18 @@ local function updateFarm(dt)
     currentTarget = nearest
 
     if not nearest then
-        -- Nothing to farm. The character is left to the game entirely here -- no
-        -- noclip, no CFrame written, gravity and collision exactly as a normal
-        -- player has them -- and just stands there until a coin shows up. Only
-        -- the flight memory is dropped, so the next coin is flown to from
-        -- wherever the character really is.
-        virtualPos = nil
+        -- nothing to go to. Once a coin has been seen this life we are inside
+        -- the round, so hold still and wait for the next one; before that we are
+        -- still in the lobby and the game is about to move us itself.
+        if seenACoinThisLife then
+            holdPosition()
+        else
+            stopMovement()
+        end
         return
     end
+
+    seenACoinThisLife = true
 
     -- fire at it and keep flying, and there is no distance to wait for: as soon
     -- as the coin is the target the shots start, and they keep coming every frame
@@ -892,6 +890,7 @@ end
 local function startMovementEngine()
     cleanupConnections()
     initCoinListeners()
+    heldCFrame = nil
     virtualPos = nil
     showErrors = false
 
@@ -945,6 +944,7 @@ local function loadScript()
     rootPart = character:WaitForChild("HumanoidRootPart")
     humanoid = character:WaitForChild("Humanoid")
 
+    seenACoinThisLife = false
     coinsCollected = 0
 
     startMovementEngine()
@@ -961,7 +961,9 @@ local function loadScript()
         rootPart = character:WaitForChild("HumanoidRootPart")
         humanoid = character:WaitForChild("Humanoid")
 
+        seenACoinThisLife = false
         bagIsFull = false
+        heldCFrame = nil
         virtualPos = nil
         -- the new character is a fresh model with collision on by itself, so
         -- there is nothing to restore here
@@ -1197,9 +1199,8 @@ createRow(45, "Auto farm", "Always the closest coin", true, function(state)
             startMovementEngine()
         end
     else
-        -- the noclip watch puts the character back by itself once enabled is
-        -- false, so there is nothing to undo here
-        virtualPos = nil
+        stopMovement()
+        stopNoclip()
     end
 end)
 
