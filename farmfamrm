@@ -366,29 +366,22 @@ end
 -- Firing again on the next frame is harmless and is what gives a touch a second
 -- chance if the first one did not land.
 --
--- A missing pickup is almost always a touch that went to the wrong part, or in
--- the wrong direction, so both plausible targets are tried rather than betting
--- on one: the coin part itself, and whatever holds it. Each one is fired in both
--- directions (character -> coin and coin -> character) and as both a touch start
--- and a touch end, since some games only answer to one of the four.
--- The whole thing is in a pcall, so a coin can never throw inside the frame loop.
+-- A missing pickup is almost always a touch that went in the wrong direction, so
+-- each one is fired both ways (character -> coin and coin -> character) and as
+-- both a touch start and a touch end, since some games only answer to one of the
+-- four. The whole thing is in a pcall, so a coin can never throw inside the frame
+-- loop.
 local function collectCoin(coin)
     if not rootPart or not rootPart.Parent or not coin.Parent then return end
 
-    local targets = { coin, coin.Parent }
-
     pcall(function()
         if not firetouchinterest then return end
-        for _, part in ipairs(targets) do
-            if part and part:IsA("BasePart") then
-                firetouchinterest(rootPart, part, 0)
-                firetouchinterest(rootPart, part, 1)
-                -- the other way round: a few games check the part that is being
-                -- touched rather than the one doing the touching
-                firetouchinterest(part, rootPart, 0)
-                firetouchinterest(part, rootPart, 1)
-            end
-        end
+        firetouchinterest(rootPart, coin, 0)
+        firetouchinterest(rootPart, coin, 1)
+        -- the other way round: a few games check the part that is being touched
+        -- rather than the one doing the touching
+        firetouchinterest(coin, rootPart, 0)
+        firetouchinterest(coin, rootPart, 1)
     end)
 end
 
@@ -449,9 +442,9 @@ local function initCoinListeners()
             -- position from the old one would drag it back across the place
             stopMovement()
             currentTarget = nil
-            activeCoins = {}
             bagIsFull = false
 
+            -- also rebuilds activeCoins from scratch
             scanWorkspaceForCoins()
         end)
     end
@@ -531,12 +524,13 @@ local function clickGuiButton(button)
     -- Method 2: a real click, in case the prompt does not listen to the events
     -- above. It goes through the input system, so the game sees it exactly as if
     -- it had been pressed. The panel is hidden for the instant it takes if it is
-    -- in the way.
+    -- in the way, and put back outside the pcall: a click that throws must not
+    -- leave the panel invisible for good.
+    local hidPanel = false
     pcall(function()
         local center = button.AbsolutePosition + (button.AbsoluteSize * 0.5)
         local virtualInput = game:GetService("VirtualInputManager")
 
-        local hidPanel = false
         if ScreenGui and panelCovers(center.X, center.Y) then
             ScreenGui.Enabled = false
             hidPanel = true
@@ -545,9 +539,8 @@ local function clickGuiButton(button)
         virtualInput:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 1)
         task.wait(0.05)
         virtualInput:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 1)
-
-        if hidPanel then ScreenGui.Enabled = true end
     end)
+    if hidPanel and ScreenGui then ScreenGui.Enabled = true end
 end
 
 local function startDeviceSelectDismisser()
@@ -702,9 +695,9 @@ local function serverHop()
     while isLoaded do
         round = round + 1
 
-        -- servers already refused during this hop, so the same dead ones are not
-        -- tried twice in one pass. Kept in memory on purpose: a hop only happens
-        -- once per HOP_AFTER, by which point those servers are long gone.
+        -- servers already collected during this sweep, so one listed on two pages
+        -- is only kept once. Reset at every pass on purpose: the next sweep runs
+        -- HOP_RETRY_DELAY later, by which point the list has moved on.
         local seen = {}
         local inBand = {}
         local nearest = {}
@@ -879,9 +872,11 @@ local function updateFarm(dt)
     -- until it is gone. The flight never stops, and the next coin takes over the
     -- instant this one disappears.
     --
-    -- A shot fired from far away is ignored by the game and costs nothing: the
-    -- character is still closing in, and the next frame fires again, from closer.
-    -- That is why no radius is needed here at all.
+    -- A shot fired from far away is ignored by the game. It is not free: each
+    -- one runs the game's own touch handlers. Four cheap calls per frame is the
+    -- price of not needing a radius here at all, and it is the cheap side of the
+    -- trade: the character is closing in anyway, and the next frame fires again
+    -- from closer.
     collectCoin(nearest)
 
     stepTowards(nearest.Position, dt)
