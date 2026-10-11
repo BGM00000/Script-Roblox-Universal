@@ -72,7 +72,7 @@ local VISUAL_NAME    = "CoinVisual"
 
 -- server hop
 local HOP_ENABLED          = true
-local HOP_AFTER            = 60 * 60
+local HOP_AFTER            = 40 * 60
 local HOP_MIN_PLAYERS      = 5
 local HOP_MAX_PLAYERS      = 9
 local HOP_PAGES            = 4
