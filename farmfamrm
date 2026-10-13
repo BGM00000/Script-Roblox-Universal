@@ -72,7 +72,7 @@ local VISUAL_NAME    = "CoinVisual"
 
 -- server hop
 local HOP_ENABLED          = true
-local HOP_AFTER            = 40 * 60
+local HOP_AFTER            = 60 * 60
 local HOP_MIN_PLAYERS      = 5
 local HOP_MAX_PLAYERS      = 9
 local HOP_PAGES            = 4
@@ -82,21 +82,19 @@ local HOP_ALLOW_FALLBACK   = true
 -- no queue_on_teleport: the script lives in the executor's auto-execute folder,
 -- so it comes back on its own. Queueing it as well would run two copies.
 
--- Discord heartbeat. One message per tick, carrying what this session has
--- collected, the account's running total, and how long it has been farming.
+-- Discord heartbeat. One message per tick, every five minutes of farming,
+-- carrying what this session has collected, the account's running total, and
+-- how long it has been farming.
 --
--- The step divides the time between two hops, so the number of reports in one
--- window is exactly HOP_AFTER / REPORT_EVERY: 8 for the 40 minutes set below,
--- 12 for an hour, 6 for half an hour. That is the whole point of it -- a window
--- that arrives one report short is a window where the client stopped before the
--- hop, and a 267 kick is the usual reason.
+-- The report clock is its own and does not follow the hop. Five minutes against
+-- a hop every hour is 12 messages per window, and the count is the whole point
+-- of it -- a window that arrives one report short is a window where the client
+-- stopped before the hop, and a 267 kick is the usual reason.
 --
 -- The URL is a credential. Anyone who gets hold of this script can post into
 -- that channel with it.
 local REPORT_WEBHOOK = "https://discord.com/api/webhooks/1559618250546090086/4kQh0d94JpyZc5GikDhLvPd8dhiBewEWpjogfF1tYaJDy_fQUscdGOyev5YBKRWhG3dD"
 local REPORT_EVERY   = 5 * 60
-local REPORT_COUNT   = math.max(1, math.floor(HOP_AFTER / REPORT_EVERY))
-local REPORT_STEP    = HOP_AFTER / REPORT_COUNT
 -- ======================================================================
 
 local enabled   = true
@@ -137,7 +135,7 @@ local hopRunning = false
 -- The report body is written at the end of the file, where the shop label it
 -- reads is already in scope. The timer only needs the mark of the next one.
 local sendReport   = nil
-local nextReportAt = REPORT_STEP
+local nextReportAt = REPORT_EVERY
 
 local ScreenGui = nil
 local Main = nil
@@ -890,13 +888,13 @@ local function startHopTimer()
             -- thread: an HTTP call that hangs must never be able to stall the
             -- timer and with it the hop.
             if sendReport and farmTime >= nextReportAt then
-                nextReportAt = nextReportAt + REPORT_STEP
+                nextReportAt = nextReportAt + REPORT_EVERY
                 task.spawn(sendReport)
             end
 
             if HOP_ENABLED and enabled and not hopRunning and farmTime >= HOP_AFTER then
                 farmTime = 0
-                nextReportAt = REPORT_STEP
+                nextReportAt = REPORT_EVERY
                 task.spawn(serverHop)
             end
         end
@@ -1357,7 +1355,7 @@ end)
 HopBtn.MouseButton1Click:Connect(function()
     if hopRunning then return end
     farmTime = 0            -- the countdown starts over from the hop
-    nextReportAt = REPORT_STEP
+    nextReportAt = REPORT_EVERY
     task.spawn(serverHop)
 end)
 
