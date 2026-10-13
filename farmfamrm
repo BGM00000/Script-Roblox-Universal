@@ -81,20 +81,6 @@ local HOP_MAX_TRY_PER_PASS = 25
 local HOP_ALLOW_FALLBACK   = true
 -- no queue_on_teleport: the script lives in the executor's auto-execute folder,
 -- so it comes back on its own. Queueing it as well would run two copies.
-
--- Discord heartbeat. One message per tick, every five minutes of farming,
--- carrying what this session has collected, the account's running total, and
--- how long it has been farming.
---
--- The report clock is its own and does not follow the hop. Five minutes against
--- a hop every hour is 12 messages per window, and the count is the whole point
--- of it -- a window that arrives one report short is a window where the client
--- stopped before the hop, and a 267 kick is the usual reason.
---
--- The URL is a credential. Anyone who gets hold of this script can post into
--- that channel with it.
-local REPORT_WEBHOOK = "https://discord.com/api/webhooks/1559618250546090086/4kQh0d94JpyZc5GikDhLvPd8dhiBewEWpjogfF1tYaJDy_fQUscdGOyev5YBKRWhG3dD"
-local REPORT_EVERY   = 5 * 60
 -- ======================================================================
 
 local enabled   = true
@@ -131,11 +117,6 @@ local hopThread                = nil
 local farmTime   = 0
 local hopsDone   = 0
 local hopRunning = false
-
--- The report body is written at the end of the file, where the shop label it
--- reads is already in scope. The timer only needs the mark of the next one.
-local sendReport   = nil
-local nextReportAt = REPORT_EVERY
 
 local ScreenGui = nil
 local Main = nil
@@ -882,19 +863,8 @@ local function startHopTimer()
             farmTime = farmTime + (now - last)
             last = now
 
-            -- The report is taken before the hop is considered, so the tick that
-            -- lands exactly on the hop still produces its report instead of
-            -- being swallowed by the teleport that follows. It runs in its own
-            -- thread: an HTTP call that hangs must never be able to stall the
-            -- timer and with it the hop.
-            if sendReport and farmTime >= nextReportAt then
-                nextReportAt = nextReportAt + REPORT_EVERY
-                task.spawn(sendReport)
-            end
-
             if HOP_ENABLED and enabled and not hopRunning and farmTime >= HOP_AFTER then
                 farmTime = 0
-                nextReportAt = REPORT_EVERY
                 task.spawn(serverHop)
             end
         end
@@ -1355,7 +1325,6 @@ end)
 HopBtn.MouseButton1Click:Connect(function()
     if hopRunning then return end
     farmTime = 0            -- the countdown starts over from the hop
-    nextReportAt = REPORT_EVERY
     task.spawn(serverHop)
 end)
 
@@ -1581,60 +1550,6 @@ UserInputService.InputChanged:Connect(function(input)
             startPos.Y.Scale, startPos.Y.Offset + delta.Y)
     end
 end)
-
--- ============================== REPORT ==============================
--- The heartbeat itself. It is written here, rather than next to the timer, for
--- one reason: it reads the shop label, and that label only exists once the
--- interface above has been built.
---
--- A report that fails says so in the console and does not try again. Retrying
--- would blur the very thing this is for -- the number of messages in a window
--- is the signal, and a late retry would paper over a gap.
-
-local httpPost = (syn and syn.request) or (http and http.request)
-    or (fluxus and fluxus.request) or http_request or request
-
-local function formatDuration(seconds)
-    local total = math.floor(seconds)
-    if total < 60 then
-        return total .. "s"
-    end
-    return math.floor(total / 60) .. " min"
-end
-
-sendReport = function()
-    if not httpPost then
-        warn("[AutoFarm/report] this executor exposes no HTTP request function,"
-            .. " so no report can be sent")
-        return
-    end
-
-    -- the game's own balance, exactly as its shop writes it
-    local total = "?"
-    if shopAmountLabel and shopAmountLabel.Parent then
-        total = shopAmountLabel.Text
-    end
-
-    local content = string.format("MM2  ·  %s  ·  session %d  ·  total %s  ·  %s",
-        player.Name, coinsCollected, tostring(total), formatDuration(farmTime))
-
-    local ok, err = pcall(function()
-        httpPost({
-            Url = REPORT_WEBHOOK,
-            Method = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body = HttpService:JSONEncode({
-                username = "MM2 farm",
-                content = content,
-            }),
-        })
-    end)
-
-    if not ok then
-        warn("[AutoFarm/report] " .. tostring(err))
-    end
-end
-
 
 -- ============================== START ==============================
 -- everything starts on, so the farm is already running when the panel appears
