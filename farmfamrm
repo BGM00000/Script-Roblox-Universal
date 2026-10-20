@@ -13,6 +13,8 @@
 --     one giant step, and when something other than this script moves the
 --     character (the game pulling it back to the lobby, a respawn), the path
 --     being followed is dropped instead of fought over.
+--   * a 267 kick that got through anyway puts Roblox's own ErrorPrompt on the
+--     screen; that prompt now fires the same hop as the panel button.
 --
 --  Load-bearing, do not "clean up":
 --   * the character is moved by writing its CFrame. No physics actuator: a
@@ -72,7 +74,7 @@ local VISUAL_NAME    = "CoinVisual"
 
 -- server hop
 local HOP_ENABLED          = true
-local HOP_AFTER            = 60 * 35
+local HOP_AFTER            = 60 * 40
 local HOP_MIN_PLAYERS      = 5
 local HOP_MAX_PLAYERS      = 9
 local HOP_PAGES            = 4
@@ -113,6 +115,7 @@ local antiAfkConnection        = nil
 local characterAddedConnection = nil
 local deviceSelectThread       = nil
 local hopThread                = nil
+local errorPromptThread        = nil
 
 local farmTime   = 0
 local hopsDone   = 0
@@ -850,6 +853,14 @@ local function serverHop()
     hopRunning = false
 end
 
+-- One way in for every hop, so the countdown starts over the same way whichever
+-- one fired it: the panel button, the timer, being alone, an error prompt.
+local function requestHop()
+    if hopRunning then return end
+    farmTime = 0
+    task.spawn(serverHop)
+end
+
 -- Only counts while the farm is switched on, so the hour really is an hour of
 -- farming.
 local function startHopTimer()
@@ -863,9 +874,8 @@ local function startHopTimer()
             farmTime = farmTime + (now - last)
             last = now
 
-            if HOP_ENABLED and enabled and not hopRunning and farmTime >= HOP_AFTER then
-                farmTime = 0
-                task.spawn(serverHop)
+            if HOP_ENABLED and enabled and farmTime >= HOP_AFTER then
+                requestHop()
             end
         end
     end)
@@ -876,13 +886,58 @@ local function startAloneWatch()
     task.spawn(function()
         while isLoaded do
             task.wait(10)
-            if HOP_ENABLED and enabled and not hopRunning
-                and #Players:GetPlayers() <= 1 then
+            if HOP_ENABLED and enabled and #Players:GetPlayers() <= 1 then
                 hopLog("Alone in this server -> hopping out")
-                farmTime = 0
-                task.spawn(serverHop)
+                requestHop()
             end
         end
+    end)
+end
+
+
+-- ============================== ERROR PROMPT ==============================
+-- A 267 kick that got through, a lost connection: Roblox puts its own
+-- ErrorPrompt over the screen and the round is over, but the client is still up
+-- and a hop is the way out. The path below is the one that prompt is documented
+-- with, not a guess at a name.
+--
+-- Looked at once a second instead of waited on: the prompt stays on screen until
+-- it is answered, so a look cannot miss it, and a connection to a GUI that may
+-- not exist yet is one more thing to keep alive across a round change.
+--
+-- A prompt already answered never fires twice. A teleport does not take the
+-- prompt off the screen, and firing on the same one again would hop out of every
+-- server we land in.
+local ERROR_PROMPT_PATH = { "RobloxPromptGui", "promptOverlay", "ErrorPrompt" }
+
+local function errorPromptOnScreen()
+    local node = game:GetService("CoreGui")
+    for _, name in ipairs(ERROR_PROMPT_PATH) do
+        node = node:FindFirstChild(name)
+        if not node then return nil end
+    end
+    return node
+end
+
+local function startErrorPromptWatch()
+    if errorPromptThread then return end
+
+    errorPromptThread = task.spawn(function()
+        local answered = nil
+        while isLoaded do
+            local prompt = errorPromptOnScreen()
+            if prompt ~= answered then
+                answered = prompt
+                -- the farm switch is the one that decides: a paused script does
+                -- not teleport anybody
+                if prompt and enabled then
+                    hopLog("Error prompt on screen -> hopping out")
+                    requestHop()
+                end
+            end
+            task.wait(1)
+        end
+        errorPromptThread = nil
     end)
 end
 
@@ -982,6 +1037,7 @@ local function unloadScript()
     -- these loops stop on their own, isLoaded is already false
     deviceSelectThread = nil
     hopThread = nil
+    errorPromptThread = nil
 
     if antiAfkConnection then
         antiAfkConnection:Disconnect()
@@ -1009,6 +1065,7 @@ local function loadScript()
     startDeviceSelectDismisser()
     startHopTimer()
     startAloneWatch()
+    startErrorPromptWatch()
     setLowRender(lowRender)
 
     if characterAddedConnection then characterAddedConnection:Disconnect() end
@@ -1322,11 +1379,7 @@ end)
 HopBtn.MouseLeave:Connect(function()
     TweenService:Create(HopBtn, TweenInfo.new(0.12), {BackgroundTransparency = 0.35}):Play()
 end)
-HopBtn.MouseButton1Click:Connect(function()
-    if hopRunning then return end
-    farmTime = 0            -- the countdown starts over from the hop
-    task.spawn(serverHop)
-end)
+HopBtn.MouseButton1Click:Connect(requestHop)
 
 divider(263)
 
