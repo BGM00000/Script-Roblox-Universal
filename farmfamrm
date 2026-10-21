@@ -52,7 +52,7 @@ local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 
 
 -- ============================== SETTINGS ==============================
-local TARGET_SPEED = 21        -- studs per second. 21 is the ceiling this
+local TARGET_SPEED = 20        -- studs per second. 21 is the ceiling this
                                -- script is tuned for: past it the step grows
                                -- faster than the game's own replication and
                                -- the practice stops being safe.
@@ -74,7 +74,7 @@ local VISUAL_NAME    = "CoinVisual"
 
 -- server hop
 local HOP_ENABLED          = true
-local HOP_AFTER            = 60 * 40
+local HOP_AFTER            = 60 * 30
 local HOP_MIN_PLAYERS      = 5
 local HOP_MAX_PLAYERS      = 9
 local HOP_PAGES            = 4
