@@ -9,12 +9,10 @@
 --     frame, which matters on a phone.
 --   * a coin is taken when its CoinVisual is gone or flagged -- the game's own
 --     signal, not a guess about names.
---   * two guards against the 267 kick. A frame that stalls no longer turns into
---     one giant step, and when something other than this script moves the
---     character (the game pulling it back to the lobby, a respawn), the path
---     being followed is dropped instead of fought over.
+--   * after a coin is taken the script waits COIN_DELAY before going for the
+--     next one, so the pace reads as a player, not a sweep.
 --   * a 267 kick that got through anyway puts Roblox's own ErrorPrompt on the
---     screen; that prompt now fires the same hop as the panel button.
+--     screen; that prompt teleports straight into a fresh server.
 --
 --  Load-bearing, do not "clean up":
 --   * the character is moved by writing its CFrame. No physics actuator: a
@@ -52,20 +50,17 @@ local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 
 
 -- ============================== SETTINGS ==============================
-local TARGET_SPEED = 20        -- studs per second. 21 is the ceiling this
+local TARGET_SPEED = 22        -- studs per second. 21 is the ceiling this
                                -- script is tuned for: past it the step grows
                                -- faster than the game's own replication and
                                -- the practice stops being safe.
-local MAX_DIST     = 1000       -- radius of the search. An MM2 map fits inside
+local MAX_DIST     = 600       -- radius of the search. An MM2 map fits inside
                                -- this with room to spare; anything past it is
                                -- not a coin on this map.
 
--- The character is unanchored and noclipped, so the engine is free to nudge it.
--- Our own writes keep the real position on top of the virtual one; a gap this
--- wide means something else moved us, not that we drifted.
-local RESYNC_DIST     = 20
-local HOLD_MAX_DRIFT  = 8
-local MAX_FRAME       = 1 / 15 -- one stalled frame must not become one jump
+-- Seconds spent on a coin before going for the next one: the pause that keeps
+-- the pace from reading as a sweep.
+local COIN_DELAY = 0.2
 
 -- Where the coins live. Structure, not a guess: the active map holds a
 -- CoinContainer, each coin under it carries a CoinVisual.
@@ -74,9 +69,9 @@ local VISUAL_NAME    = "CoinVisual"
 
 -- server hop
 local HOP_ENABLED          = true
-local HOP_AFTER            = 60 * 30
+local HOP_AFTER            = 60 * 45
 local HOP_MIN_PLAYERS      = 5
-local HOP_MAX_PLAYERS      = 9
+local HOP_MAX_PLAYERS      = 8
 local HOP_PAGES            = 4
 local HOP_RETRY_DELAY      = 10
 local HOP_MAX_TRY_PER_PASS = 25
@@ -92,18 +87,16 @@ local lowRender = true
 local isLoaded       = false
 local bagIsFull      = false
 local showErrors     = false
-local holdArmed      = false  -- may the script pin the character where it is
 local lowRenderWorks = true   -- did the executor's call actually take
 
 local activeCoins    = {}
 local currentTarget  = nil
+local lastTarget     = nil    -- the coin we were flying at last frame
+local coinWaitUntil  = 0      -- os.clock() time before which no coin is taken
 local coinsCollected = 0
 
 local container   = nil
 local containerConnection = nil
-
-local heldCFrame = nil
-local virtualPos = nil
 
 local heartbeatConnection      = nil
 local noclipConnection         = nil
@@ -150,8 +143,6 @@ local function currentRotation()
 end
 
 local function stopMovement()
-    heldCFrame = nil
-    virtualPos = nil
     if rootPart then
         rootPart.AssemblyLinearVelocity = Vector3.zero
         rootPart.AssemblyAngularVelocity = Vector3.zero
@@ -171,79 +162,35 @@ local function setLowRender(state)
     return ok
 end
 
--- Between two coins the character has nothing to stand on, so it would slowly
--- sink through the map. Putting its own CFrame back every frame keeps it where
--- it is, with nothing physical involved.
---
--- It only does that while the position it is holding is still roughly where the
--- character actually is. A game teleport is not a drift to correct: fighting it
--- is how a character ends up somewhere impossible. On a real move the hold is
--- dropped for good, until a coin is seen again and the round is clearly back on.
-local function holdPosition()
-    if not rootPart or not rootPart.Parent then return end
-    virtualPos = nil
-
-    if not heldCFrame then
-        local cf = rootPart.CFrame
-        if not isFiniteVector(cf.Position) then return end
-        heldCFrame = cf
-    end
-
-    if (rootPart.Position - heldCFrame.Position).Magnitude > HOLD_MAX_DRIFT then
-        heldCFrame = nil
-        holdArmed = false
-        return
-    end
-
-    rootPart.CFrame = heldCFrame
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-end
-
+-- One frame of flying at the coin: a straight step, no faster than TARGET_SPEED,
+-- that stops exactly on it.
 local function stepTowards(targetPos, dt)
     if not rootPart or not rootPart.Parent then return end
 
     local rootPos = rootPart.Position
     if not isFiniteVector(rootPos) then return end
 
-    if not virtualPos or not isFiniteVector(virtualPos) then
-        virtualPos = rootPos
-    elseif (rootPos - virtualPos).Magnitude > RESYNC_DIST then
-        -- Something other than us moved the character: the round ended and the
-        -- game is putting it back in the lobby, or it respawned. The path we
-        -- were following starts from a place we are no longer at.
-        virtualPos = rootPos
-    end
-
-    -- an absolute position, not "current position + one step": with a relative
-    -- move gravity adds up frame after frame and the character sinks through
-    -- the map. Writing the intended position each frame wipes that out.
-    local direction = targetPos - virtualPos
+    local direction = targetPos - rootPos
     local distance = direction.Magnitude
     if distance < 0.001 then return end
 
-    -- never overshoot: the step stops exactly on the coin
-    local step = math.min(TARGET_SPEED * math.min(dt, MAX_FRAME), distance)
+    local step = math.min(TARGET_SPEED * dt, distance)
     if step <= 0 then return end
 
-    local newPos = virtualPos + direction.Unit * step
-    if not isFiniteVector(newPos) then return end
-
-    virtualPos = newPos
-    heldCFrame = nil
-    rootPart.CFrame = CFrame.new(newPos) * currentRotation()
+    rootPart.CFrame = CFrame.new(rootPos + direction.Unit * step) * currentRotation()
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
 end
 
 
 -- ============================== NOCLIP ==============================
--- Anything the game adds to the character later (a tool, an accessory) has to be
--- picked up too, otherwise it is the one part that still collides with the world.
+-- Every part of the character, not just its direct children: anything the game
+-- adds later (a tool, a hat) keeps its handle one level deeper, and that handle
+-- is the one part still colliding when only the top level is taken.
 local function refreshCharacterParts()
     characterParts = {}
     if not character then return end
-    for _, part in ipairs(character:GetChildren()) do
+    for _, part in ipairs(character:GetDescendants()) do
         if part:IsA("BasePart") then
             table.insert(characterParts, part)
         end
@@ -259,7 +206,7 @@ local function watchCharacterParts()
     end
     if not character then return end
 
-    characterChildConnection = character.ChildAdded:Connect(function(child)
+    characterChildConnection = character.DescendantAdded:Connect(function(child)
         if child:IsA("BasePart") and not table.find(characterParts, child) then
             table.insert(characterParts, child)
         end
@@ -269,6 +216,15 @@ end
 local function startNoclip()
     if noclipConnection then noclipConnection:Disconnect() end
     watchCharacterParts()
+
+    -- The root stays unanchored on purpose: an anchored assembly stops reporting
+    -- touches, and the coins are taken through exactly that.
+    if humanoid then
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
+    end
 
     noclipConnection = RunService.Stepped:Connect(function()
         if not character or not enabled or not humanoid or humanoid.Health <= 0 then return end
@@ -281,20 +237,15 @@ local function startNoclip()
             end
         end
     end)
-
-    if humanoid then
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.Physics, false)
-    end
 end
 
+-- Hand the character back to the game.
 local function stopNoclip()
     if noclipConnection then
         noclipConnection:Disconnect()
         noclipConnection = nil
     end
+    if humanoid then humanoid.PlatformStand = false end
 end
 
 -- Put collision back, carefully. After a whole round of noclip the character is
@@ -510,10 +461,7 @@ local function initCoinListeners()
     for _, name in ipairs({ "VictoryScreen", "RoundEndFade", "LoadingMap" }) do
         local signal = gameplayRemotes:FindFirstChild(name)
         if signal and signal:IsA("RemoteEvent") then
-            table.insert(roundEndConnections, signal.OnClientEvent:Connect(function()
-                stopMovement()
-                holdArmed = false
-            end))
+            table.insert(roundEndConnections, signal.OnClientEvent:Connect(stopMovement))
         end
     end
 
@@ -522,11 +470,7 @@ local function initCoinListeners()
 
     if coinsStartedRemote then
         coinsStartedConnection = coinsStartedRemote.OnClientEvent:Connect(function()
-            -- stopMovement also forgets where the character was, which matters
-            -- here: it is about to be moved to a new map, and a remembered
-            -- position from the old one would drag it back across the place
             stopMovement()
-            holdArmed = false
             bagIsFull = false
             rescanContainer()
         end)
@@ -897,17 +841,8 @@ end
 
 -- ============================== ERROR PROMPT ==============================
 -- A 267 kick that got through, a lost connection: Roblox puts its own
--- ErrorPrompt over the screen and the round is over, but the client is still up
--- and a hop is the way out. The path below is the one that prompt is documented
--- with, not a guess at a name.
---
--- Looked at once a second instead of waited on: the prompt stays on screen until
--- it is answered, so a look cannot miss it, and a connection to a GUI that may
--- not exist yet is one more thing to keep alive across a round change.
---
--- A prompt already answered never fires twice. A teleport does not take the
--- prompt off the screen, and firing on the same one again would hop out of every
--- server we land in.
+-- ErrorPrompt over the screen. Teleporting to the place is the game's own "join
+-- a random server", so it is fired as soon as the prompt is seen.
 local ERROR_PROMPT_PATH = { "RobloxPromptGui", "promptOverlay", "ErrorPrompt" }
 
 local function errorPromptOnScreen()
@@ -923,19 +858,15 @@ local function startErrorPromptWatch()
     if errorPromptThread then return end
 
     errorPromptThread = task.spawn(function()
-        local answered = nil
         while isLoaded do
-            local prompt = errorPromptOnScreen()
-            if prompt ~= answered then
-                answered = prompt
-                -- the farm switch is the one that decides: a paused script does
-                -- not teleport anybody
-                if prompt and enabled then
-                    hopLog("Error prompt on screen -> hopping out")
-                    requestHop()
-                end
+            if errorPromptOnScreen() then
+                hopLog("Error prompt on screen -> teleporting to a new server")
+                pcall(function()
+                    TeleportService:Teleport(game.PlaceId)
+                end)
+                task.wait(5)   -- let the client leave before trying again
             end
-            task.wait(1)
+            task.wait(0.5)
         end
         errorPromptThread = nil
     end)
@@ -956,9 +887,20 @@ local function cleanupConnections()
     unhookContainer()
 end
 
+-- The flight cuts through the floor, so it is only allowed while there is a coin
+-- to fly at. The rest of the time the Humanoid stands the character back on the
+-- ground instead of letting it sink through the world -- in the lobby there is
+-- nothing below, and it would fall forever.
+local function standDown(state)
+    if humanoid and humanoid.PlatformStand ~= state then
+        humanoid.PlatformStand = state
+    end
+end
+
 local function updateFarm(dt)
     if not enabled or not rootPart or not rootPart.Parent or not humanoid or humanoid.Health <= 0 then
         stopMovement()
+        standDown(false)
         return
     end
 
@@ -966,32 +908,46 @@ local function updateFarm(dt)
     -- hands off it
     if bagIsFull then
         stopMovement()
+        standDown(false)
         return
     end
 
     local rootPos = rootPart.Position
     if not isFiniteVector(rootPos) then
         stopMovement()
+        standDown(false)
         return
     end
+
+    -- The coin we were flying at is gone: it was taken. Hold still for COIN_DELAY
+    -- before going for the next one.
+    if lastTarget and not coinIsAvailable(lastTarget) then
+        lastTarget = nil
+        currentTarget = nil
+        coinWaitUntil = os.clock() + COIN_DELAY
+    end
+
+    if os.clock() < coinWaitUntil then
+        stopMovement()
+        return
+    end
+
+    -- if noclip somehow got switched off during the wait, put it back before
+    -- flying on
+    if not noclipConnection and not bagIsFull then startNoclip() end
 
     local nearest = findNearestCoin(rootPos)
     currentTarget = nearest
 
     if not nearest then
-        -- Nothing to go to. If a coin has already been seen this life the round
-        -- is on and there is simply a gap between spawns, so stay put instead of
-        -- sinking through the map. Before that we are still in the lobby and the
-        -- game is about to move us itself, so do not touch it at all.
-        if holdArmed then
-            holdPosition()
-        else
-            stopMovement()
-        end
+        -- Nothing to go to: stand normally and wait for one to appear.
+        stopMovement()
+        standDown(false)
         return
     end
 
-    holdArmed = true
+    lastTarget = nearest
+    standDown(true)
 
     -- fire at it and keep flying. A shot fired from far away is ignored by the
     -- game and costs nothing: the character is still closing in, and the next
@@ -1003,8 +959,6 @@ end
 local function startMovementEngine()
     cleanupConnections()
     initCoinListeners()
-    heldCFrame = nil
-    virtualPos = nil
     showErrors = false
 
     if enabled and not bagIsFull then startNoclip() end
@@ -1053,7 +1007,8 @@ local function loadScript()
     if isLoaded then unloadScript() end
     isLoaded = true
     bagIsFull = false
-    holdArmed = false
+    lastTarget = nil
+    coinWaitUntil = 0
 
     character = player.Character or player.CharacterAdded:Wait()
     rootPart = character:WaitForChild("HumanoidRootPart")
@@ -1076,10 +1031,9 @@ local function loadScript()
         rootPart = character:WaitForChild("HumanoidRootPart")
         humanoid = character:WaitForChild("Humanoid")
 
-        holdArmed = false
         bagIsFull = false
-        heldCFrame = nil
-        virtualPos = nil
+        lastTarget = nil
+        coinWaitUntil = 0
         -- the new character is a fresh model with collision on by itself, so
         -- there is nothing to restore here
 
