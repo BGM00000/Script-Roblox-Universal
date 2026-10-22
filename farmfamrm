@@ -39,6 +39,7 @@ local VirtualUser = game:GetService("VirtualUser")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
+local CoreGui = game:GetService("CoreGui")
 
 local player = Players.LocalPlayer
 local character = player.Character or player.CharacterAdded:Wait()
@@ -50,7 +51,7 @@ local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 
 
 -- ============================== SETTINGS ==============================
-local TARGET_SPEED = 22        -- studs per second. 21 is the ceiling this
+local TARGET_SPEED = 24        -- studs per second. 21 is the ceiling this
                                -- script is tuned for: past it the step grows
                                -- faster than the game's own replication and
                                -- the practice stops being safe.
@@ -69,7 +70,7 @@ local VISUAL_NAME    = "CoinVisual"
 
 -- server hop
 local HOP_ENABLED          = true
-local HOP_AFTER            = 60 * 30
+local HOP_AFTER            = 60 * 40
 local HOP_MIN_PLAYERS      = 5
 local HOP_MAX_PLAYERS      = 8
 local HOP_PAGES            = 4
@@ -91,7 +92,6 @@ local lowRenderWorks = true   -- did the executor's call actually take
 
 local activeCoins    = {}
 local currentTarget  = nil
-local lastTarget     = nil    -- the coin we were flying at last frame
 local coinWaitUntil  = 0      -- os.clock() time before which no coin is taken
 local coinsCollected = 0
 
@@ -142,6 +142,15 @@ local function currentRotation()
     return CFrame.new()
 end
 
+-- Follow a list of child names from a root, nil as soon as one is missing.
+local function walkPath(root, path)
+    for _, name in ipairs(path) do
+        root = root:FindFirstChild(name)
+        if not root then return nil end
+    end
+    return root
+end
+
 local function stopMovement()
     if rootPart then
         rootPart.AssemblyLinearVelocity = Vector3.zero
@@ -178,8 +187,7 @@ local function stepTowards(targetPos, dt)
     if step <= 0 then return end
 
     rootPart.CFrame = CFrame.new(rootPos + direction.Unit * step) * currentRotation()
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
+    stopMovement()
 end
 
 
@@ -211,6 +219,16 @@ local function watchCharacterParts()
             table.insert(characterParts, child)
         end
     end)
+end
+
+-- The flight cuts through the floor, so it is only allowed while there is a coin
+-- to fly at. The rest of the time the Humanoid stands the character back on the
+-- ground instead of letting it sink through the world -- in the lobby there is
+-- nothing below, and it would fall forever.
+local function standDown(state)
+    if humanoid and humanoid.PlatformStand ~= state then
+        humanoid.PlatformStand = state
+    end
 end
 
 local function startNoclip()
@@ -245,7 +263,7 @@ local function stopNoclip()
         noclipConnection:Disconnect()
         noclipConnection = nil
     end
-    if humanoid then humanoid.PlatformStand = false end
+    standDown(false)
 end
 
 -- Put collision back, carefully. After a whole round of noclip the character is
@@ -259,8 +277,7 @@ local function restoreCollisionSafely()
         if isFiniteVector(base) then
             pcall(function()
                 rootPart.CFrame = CFrame.new(base + Vector3.new(0, 8, 0)) * currentRotation()
-                rootPart.AssemblyLinearVelocity = Vector3.zero
-                rootPart.AssemblyAngularVelocity = Vector3.zero
+                stopMovement()
             end)
         end
     end
@@ -490,6 +507,8 @@ local function initCoinListeners()
         coinCollectedConnection = coinCollectedRemote.OnClientEvent:Connect(
             function(_coinType, currentAmount, maxAmount)
                 coinsCollected = coinsCollected + 1
+                -- the pace: hold still for COIN_DELAY on the coin just banked
+                coinWaitUntil = os.clock() + COIN_DELAY
 
                 if type(currentAmount) == "number" and type(maxAmount) == "number"
                     and maxAmount > 0 and currentAmount >= maxAmount then
@@ -509,13 +528,8 @@ local DEVICE_PATH = { "DeviceSelect", "Container", "Tablet", "Button" }
 
 local function findDeviceSelectButton()
     local playerGui = player:FindFirstChild("PlayerGui")
-    if not playerGui then return nil end
-
-    local node = playerGui
-    for _, name in ipairs(DEVICE_PATH) do
-        node = node:FindFirstChild(name)
-        if not node then return nil end
-    end
+    local node = playerGui and walkPath(playerGui, DEVICE_PATH)
+    if not node then return nil end
 
     if not node.Visible then return nil end
     local deviceSelect = node:FindFirstAncestorOfClass("ScreenGui")
@@ -798,7 +812,7 @@ local function serverHop()
 end
 
 -- One way in for every hop, so the countdown starts over the same way whichever
--- one fired it: the panel button, the timer, being alone, an error prompt.
+-- one fired it: the panel button, the timer, being alone.
 local function requestHop()
     if hopRunning then return end
     farmTime = 0
@@ -846,12 +860,7 @@ end
 local ERROR_PROMPT_PATH = { "RobloxPromptGui", "promptOverlay", "ErrorPrompt" }
 
 local function errorPromptOnScreen()
-    local node = game:GetService("CoreGui")
-    for _, name in ipairs(ERROR_PROMPT_PATH) do
-        node = node:FindFirstChild(name)
-        if not node then return nil end
-    end
-    return node
+    return walkPath(CoreGui, ERROR_PROMPT_PATH)
 end
 
 local function startErrorPromptWatch()
@@ -887,66 +896,43 @@ local function cleanupConnections()
     unhookContainer()
 end
 
--- The flight cuts through the floor, so it is only allowed while there is a coin
--- to fly at. The rest of the time the Humanoid stands the character back on the
--- ground instead of letting it sink through the world -- in the lobby there is
--- nothing below, and it would fall forever.
-local function standDown(state)
-    if humanoid and humanoid.PlatformStand ~= state then
-        humanoid.PlatformStand = state
-    end
+-- Stand still and hand the character back to the Humanoid.
+local function idle()
+    stopMovement()
+    standDown(false)
 end
 
 local function updateFarm(dt)
     if not enabled or not rootPart or not rootPart.Parent or not humanoid or humanoid.Health <= 0 then
-        stopMovement()
-        standDown(false)
-        return
+        return idle()
     end
 
     -- the bag is full: the game is about to move the character, so we keep our
     -- hands off it
     if bagIsFull then
-        stopMovement()
-        standDown(false)
-        return
+        return idle()
     end
 
     local rootPos = rootPart.Position
     if not isFiniteVector(rootPos) then
-        stopMovement()
-        standDown(false)
-        return
+        return idle()
     end
 
-    -- The coin we were flying at is gone: it was taken. Hold still for COIN_DELAY
-    -- before going for the next one.
-    if lastTarget and not coinIsAvailable(lastTarget) then
-        lastTarget = nil
-        currentTarget = nil
-        coinWaitUntil = os.clock() + COIN_DELAY
-    end
-
+    -- the game banked a coin a moment ago: hold still for COIN_DELAY so the pace
+    -- stays human
     if os.clock() < coinWaitUntil then
         stopMovement()
         return
     end
-
-    -- if noclip somehow got switched off during the wait, put it back before
-    -- flying on
-    if not noclipConnection and not bagIsFull then startNoclip() end
 
     local nearest = findNearestCoin(rootPos)
     currentTarget = nearest
 
     if not nearest then
         -- Nothing to go to: stand normally and wait for one to appear.
-        stopMovement()
-        standDown(false)
-        return
+        return idle()
     end
 
-    lastTarget = nearest
     standDown(true)
 
     -- fire at it and keep flying. A shot fired from far away is ignored by the
@@ -1007,7 +993,6 @@ local function loadScript()
     if isLoaded then unloadScript() end
     isLoaded = true
     bagIsFull = false
-    lastTarget = nil
     coinWaitUntil = 0
 
     character = player.Character or player.CharacterAdded:Wait()
@@ -1032,7 +1017,6 @@ local function loadScript()
         humanoid = character:WaitForChild("Humanoid")
 
         bagIsFull = false
-        lastTarget = nil
         coinWaitUntil = 0
         -- the new character is a fresh model with collision on by itself, so
         -- there is nothing to restore here
@@ -1343,13 +1327,8 @@ divider(263)
 local function findShopAmount()
     local playerGui = player:FindFirstChild("PlayerGui")
     if not playerGui then return nil end
-
-    local node = playerGui
-    for _, name in ipairs({ "CrossPlatform", "Shop", "Medium", "Title", "Coins", "Container", "Amount" }) do
-        node = node:FindFirstChild(name)
-        if not node then return nil end
-    end
-    return node
+    return walkPath(playerGui,
+        { "CrossPlatform", "Shop", "Medium", "Title", "Coins", "Container", "Amount" })
 end
 
 local shopAmountLabel = nil
