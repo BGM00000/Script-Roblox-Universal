@@ -158,12 +158,40 @@ local function stopMovement()
     end
 end
 
+-- Best effort on a phone: drop the client's own render quality at the same time
+-- as the 3D rendering, and put it back when the row is switched off.
+local savedQuality = nil
+local savedRenderQuality = nil
+
+local function setGameQuality(state)
+    pcall(function()
+        local userGameSettings = UserSettings():GetService("UserGameSettings")
+        if state then
+            savedQuality = savedQuality or userGameSettings.SavedQualityLevel
+            userGameSettings.SavedQualityLevel = Enum.SavedQualitySetting.QualityLevel1
+        elseif savedQuality then
+            userGameSettings.SavedQualityLevel = savedQuality
+        end
+    end)
+
+    pcall(function()
+        local rendering = settings().Rendering
+        if state then
+            savedRenderQuality = savedRenderQuality or rendering.QualityLevel
+            rendering.QualityLevel = Enum.QualityLevel.Level01
+        elseif savedRenderQuality then
+            rendering.QualityLevel = savedRenderQuality
+        end
+    end)
+end
+
 -- Draw nothing but the interface. The farm moves by coordinates and takes coins
 -- through touch events, so turning 3D rendering off changes nothing about what
 -- it does. This is an executor capability: an executor without it keeps
 -- rendering and says so in the panel.
 local function setLowRender(state)
     lowRender = state and true or false
+    setGameQuality(lowRender)
     local ok = pcall(function()
         RunService:Set3dRenderingEnabled(not lowRender)
     end)
@@ -386,19 +414,19 @@ local function fireBothWays(a, b)
     firetouchinterest(b, a, 1)
 end
 
+local function fireCoinTouch(coin, visual)
+    if not firetouchinterest then return end
+    fireBothWays(rootPart, coin)
+    fireBothWays(rootPart, visual)
+end
+
 -- Fired from wherever the character is while it flies over. Firing again on the
 -- next frame is harmless and is what gives a touch a second chance if the first
 -- one did not land. Wrapped, so a coin can never throw inside the frame loop.
+-- The body is a named function, not a closure per call: this runs every frame.
 local function collectCoin(coin)
     if not rootPart or not rootPart.Parent or not coin.Parent then return end
-
-    local visual = coinVisualOf(coin)
-
-    pcall(function()
-        if not firetouchinterest then return end
-        fireBothWays(rootPart, coin)
-        fireBothWays(rootPart, visual)
-    end)
+    pcall(fireCoinTouch, coin, coinVisualOf(coin))
 end
 
 -- The container is re-found from scratch on every round, because the map -- and
