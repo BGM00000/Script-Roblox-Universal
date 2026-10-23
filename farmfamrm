@@ -55,13 +55,13 @@ local TARGET_SPEED = 24        -- studs per second. 21 is the ceiling this
                                -- script is tuned for: past it the step grows
                                -- faster than the game's own replication and
                                -- the practice stops being safe.
-local MAX_DIST     = 600       -- radius of the search. An MM2 map fits inside
+local MAX_DIST     = 1000       -- radius of the search. An MM2 map fits inside
                                -- this with room to spare; anything past it is
                                -- not a coin on this map.
 
 -- Seconds spent on a coin before going for the next one: the pause that keeps
 -- the pace from reading as a sweep.
-local COIN_DELAY = 0.2
+local COIN_DELAY = 0.1
 
 -- Where the coins live. Structure, not a guess: the active map holds a
 -- CoinContainer, each coin under it carries a CoinVisual.
