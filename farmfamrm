@@ -61,7 +61,7 @@ local MAX_DIST     = 1000       -- radius of the search. An MM2 map fits inside
 
 -- Seconds spent on a coin before going for the next one: the pause that keeps
 -- the pace from reading as a sweep.
-local COIN_DELAY = 0.1
+local COIN_DELAY = 0.15
 
 -- Where the coins live. Structure, not a guess: the active map holds a
 -- CoinContainer, each coin under it carries a CoinVisual.
