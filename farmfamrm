@@ -70,12 +70,15 @@ local VISUAL_NAME    = "CoinVisual"
 
 -- server hop
 local HOP_ENABLED          = true
-local HOP_AFTER            = 60 * 40
+local HOP_AFTER            = 60 * 30
+-- Not one coin taken since the script started by this point: the server is not
+-- giving anything, so leave it instead of waiting out the full HOP_AFTER.
+local HOP_STALL_AFTER      = 60 * 10
 local HOP_MIN_PLAYERS      = 5
 local HOP_MAX_PLAYERS      = 8
-local HOP_PAGES            = 4
-local HOP_RETRY_DELAY      = 10
-local HOP_MAX_TRY_PER_PASS = 25
+local HOP_PAGES            = 5
+local HOP_RETRY_DELAY      = 15
+local HOP_MAX_TRY_PER_PASS = 30
 local HOP_ALLOW_FALLBACK   = true
 -- no queue_on_teleport: the script lives in the executor's auto-execute folder,
 -- so it comes back on its own. Queueing it as well would run two copies.
@@ -857,11 +860,25 @@ local function startHopTimer()
         while isLoaded do
             task.wait(1)
             local now = os.clock()
-            farmTime = farmTime + (now - last)
+            -- only while the farm is running, so the hour really is an hour of
+            -- farming -- and so a pause cannot be mistaken for a stalled server
+            if enabled then
+                farmTime = farmTime + (now - last)
+            end
             last = now
 
-            if HOP_ENABLED and enabled and farmTime >= HOP_AFTER then
-                requestHop()
+            if HOP_ENABLED and enabled then
+                if farmTime >= HOP_AFTER then
+                    requestHop()
+                -- A whole HOP_STALL_AFTER with no coin taken at all: nothing is
+                -- being farmed here, so try another server. Fires once per
+                -- HOP_STALL_AFTER at most -- requestHop resets farmTime -- and
+                -- never again once a single coin has been banked this session.
+                elseif coinsCollected == 0 and farmTime >= HOP_STALL_AFTER then
+                    hopLog(("No coin taken in %d min -> hopping out")
+                        :format(math.floor(HOP_STALL_AFTER / 60)))
+                    requestHop()
+                end
             end
         end
     end)
