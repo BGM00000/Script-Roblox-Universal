@@ -138,7 +138,6 @@ local hopRunning = false
 
 local ScreenGui = nil
 local Main = nil
-local hopDesc = nil
 
 local characterParts = {}
 
@@ -152,6 +151,12 @@ local function bindCharacter(newChar)
     character = newChar or player.Character or player.CharacterAdded:Wait()
     rootPart = character:WaitForChild("HumanoidRootPart")
     humanoid = character:WaitForChild("Humanoid")
+
+    -- state that belongs to a character, not to the session: a new one starts
+    -- with an empty bag and no leftover coin pause. coinsCollected stays
+    -- session-scoped and is deliberately not reset here.
+    bagIsFull = false
+    coinWaitUntil = 0
 end
 
 -- The executor's HTTP backend, if it has one. Resolved per call: executors
@@ -188,6 +193,12 @@ local function walkPath(root, path)
         if not root then return nil end
     end
     return root
+end
+
+-- Drop one connection and clear its variable in the same line: every teardown
+-- site wants both, and a call with no return values assigns nil.
+local function dropConnection(connection)
+    if connection then connection:Disconnect() end
 end
 
 local function stopMovement()
@@ -278,10 +289,7 @@ end
 local function watchCharacterParts()
     refreshCharacterParts()
 
-    if characterChildConnection then
-        characterChildConnection:Disconnect()
-        characterChildConnection = nil
-    end
+    characterChildConnection = dropConnection(characterChildConnection)
     if not character then return end
 
     characterChildConnection = character.DescendantAdded:Connect(function(child)
@@ -302,7 +310,7 @@ local function standDown(state)
 end
 
 local function startNoclip()
-    if noclipConnection then noclipConnection:Disconnect() end
+    noclipConnection = dropConnection(noclipConnection)
     watchCharacterParts()
 
     -- The root stays unanchored on purpose: an anchored assembly stops reporting
@@ -329,10 +337,7 @@ end
 
 -- Hand the character back to the game.
 local function stopNoclip()
-    if noclipConnection then
-        noclipConnection:Disconnect()
-        noclipConnection = nil
-    end
+    noclipConnection = dropConnection(noclipConnection)
     standDown(false)
 end
 
@@ -433,10 +438,12 @@ local function findNearestCoin(rootPos)
             -- gone from the tree for good; the round's own cleanup will not
             -- bring this object back
             activeCoins[coin] = nil
-        elseif coinIsAvailable(coin) then
+        else
+            -- distance first: only a coin that can still win pays for the
+            -- attribute and child lookups in coinIsAvailable
             local offset = coin.Position - rootPos
             local sq = offset.X * offset.X + offset.Y * offset.Y + offset.Z * offset.Z
-            if sq < nearestSq then
+            if sq < nearestSq and coinIsAvailable(coin) then
                 nearest, nearestVisual, nearestSq = coin, coinVisualOf(coin), sq
             end
         end
@@ -477,10 +484,7 @@ end
 -- The container is re-found from scratch on every round, because the map -- and
 -- with it the container object -- is a new one each time.
 local function unhookContainer()
-    if containerConnection then
-        containerConnection:Disconnect()
-        containerConnection = nil
-    end
+    containerConnection = dropConnection(containerConnection)
 end
 
 local function rescanContainer()
@@ -944,32 +948,28 @@ end
 -- ErrorPrompt over the screen. Teleporting to the place is the game's own "join
 -- a random server", so it is fired as soon as the prompt is seen.
 local ERROR_PROMPT_PATH = { "RobloxPromptGui", "promptOverlay", "ErrorPrompt" }
--- The reason the game writes inside that prompt, when it writes one.
-local ERROR_MESSAGE_PATH = { "RobloxPromptGui", "promptOverlay", "ErrorPrompt",
-    "MessageArea", "ErrorFrame", "ErrorMessage" }
+-- The reason the game writes inside that prompt; the rest of the path is the
+-- one the watch below already resolved.
+local ERROR_MESSAGE_PATH = { "MessageArea", "ErrorFrame", "ErrorMessage" }
 
 -- One message per prompt: the watch below runs twice a second and the prompt
 -- can stay up for a while.
 local errorNotified = false
 
-local function errorPromptOnScreen()
-    return walkPath(CoreGui, ERROR_PROMPT_PATH)
-end
-
-local function errorMessageText()
-    local label = walkPath(CoreGui, ERROR_MESSAGE_PATH)
+local function errorMessageText(prompt)
+    local label = prompt and walkPath(prompt, ERROR_MESSAGE_PATH)
     local text = label and label.Text
     return text and text ~= "" and text or "(no message)"
 end
 
 -- Best effort. Only the executor's request backend can post off Roblox's
 -- domains; without one the notification is lost and the hop still happens.
-local function notifyError()
+local function notifyError(prompt)
     local httpRequest = httpBackend()
     if not httpRequest then return end
 
     local content = ("Erreur à %s — %s : %s"):format(
-        os.date("%Y-%m-%d %H:%M:%S"), player.Name, errorMessageText())
+        os.date("%Y-%m-%d %H:%M:%S"), player.Name, errorMessageText(prompt))
 
     local ok, body = pcall(HttpService.JSONEncode, HttpService, { content = content })
     if not ok then return end
@@ -983,14 +983,15 @@ local function notifyError()
 end
 
 local function startErrorPromptWatch()
-    if errorPromptThread then return end
+    if errorPromptThread then task.cancel(errorPromptThread) end
 
     errorPromptThread = task.spawn(function()
         while isLoaded do
-            if errorPromptOnScreen() then
+            local prompt = walkPath(CoreGui, ERROR_PROMPT_PATH)
+            if prompt then
                 if not errorNotified then
                     errorNotified = true
-                    notifyError()
+                    notifyError(prompt)
                 end
                 hopLog("Error prompt on screen -> teleporting to a new server")
                 pcall(function()
@@ -1002,33 +1003,17 @@ local function startErrorPromptWatch()
             end
             task.wait(0.5)
         end
-        errorPromptThread = nil
     end)
 end
 
 
 -- ============================== FARM LOOP ==============================
 local function cleanupConnections()
-    if heartbeatConnection then
-        heartbeatConnection:Disconnect()
-        heartbeatConnection = nil
-    end
-    if noclipConnection then
-        noclipConnection:Disconnect()
-        noclipConnection = nil
-    end
-    if coinsStartedConnection then
-        coinsStartedConnection:Disconnect()
-        coinsStartedConnection = nil
-    end
-    if coinCollectedConnection then
-        coinCollectedConnection:Disconnect()
-        coinCollectedConnection = nil
-    end
-    if characterChildConnection then
-        characterChildConnection:Disconnect()
-        characterChildConnection = nil
-    end
+    heartbeatConnection      = dropConnection(heartbeatConnection)
+    noclipConnection         = dropConnection(noclipConnection)
+    coinsStartedConnection   = dropConnection(coinsStartedConnection)
+    coinCollectedConnection  = dropConnection(coinCollectedConnection)
+    characterChildConnection = dropConnection(characterChildConnection)
     for _, connection in ipairs(roundEndConnections) do
         connection:Disconnect()
     end
@@ -1119,26 +1104,22 @@ local function unloadScript()
     restoreCollisionSafely()
     setLowRender(false)
 
-    -- these loops stop on their own, isLoaded is already false
+    -- these loops would stop on their own (isLoaded is already false), but
+    -- cancelling releases them now and leaves no stale handle for the next load
+    if deviceSelectThread then task.cancel(deviceSelectThread) end
+    if hopThread then task.cancel(hopThread) end
+    if errorPromptThread then task.cancel(errorPromptThread) end
     deviceSelectThread = nil
     hopThread = nil
     errorPromptThread = nil
 
-    if antiAfkConnection then
-        antiAfkConnection:Disconnect()
-        antiAfkConnection = nil
-    end
-    if characterAddedConnection then
-        characterAddedConnection:Disconnect()
-        characterAddedConnection = nil
-    end
+    antiAfkConnection = dropConnection(antiAfkConnection)
+    characterAddedConnection = dropConnection(characterAddedConnection)
 end
 
 local function loadScript()
     if isLoaded then unloadScript() end
     isLoaded = true
-    bagIsFull = false
-    coinWaitUntil = 0
 
     bindCharacter()
 
@@ -1151,14 +1132,12 @@ local function loadScript()
     startErrorPromptWatch()
     setLowRender(lowRender)
 
-    if characterAddedConnection then characterAddedConnection:Disconnect() end
+    characterAddedConnection = dropConnection(characterAddedConnection)
     characterAddedConnection = player.CharacterAdded:Connect(function(newChar)
         cleanupConnections()
 
         bindCharacter(newChar)
 
-        bagIsFull = false
-        coinWaitUntil = 0
         -- the new character is a fresh model with collision on by itself, so
         -- there is nothing to restore here
 
@@ -1418,7 +1397,7 @@ end)
 divider(184)
 
 -- the description line of this row is taken over by the countdown
-hopDesc = createRow(185, "Server hop", "Every 60 min", HOP_ENABLED, function(state)
+local hopDesc = createRow(185, "Server hop", "Every 60 min", HOP_ENABLED, function(state)
     HOP_ENABLED = state
     if state then farmTime = 0 end
 end)
