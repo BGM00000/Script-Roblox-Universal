@@ -965,11 +965,15 @@ end
 -- Best effort. Only the executor's request backend can post off Roblox's
 -- domains; without one the notification is lost and the hop still happens.
 local function notifyError(prompt)
+    local reason = errorMessageText(prompt)
+    -- 772 is filtered on purpose: not worth a notification.
+    if string.find(reason, "772", 1, true) then return end
+
     local httpRequest = httpBackend()
     if not httpRequest then return end
 
     local content = ("Erreur à %s — %s : %s"):format(
-        os.date("%Y-%m-%d %H:%M:%S"), player.Name, errorMessageText(prompt))
+        os.date("%Y-%m-%d %H:%M:%S"), player.Name, reason)
 
     local ok, body = pcall(HttpService.JSONEncode, HttpService, { content = content })
     if not ok then return end
