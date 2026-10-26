@@ -25,11 +25,12 @@
 --     map. Depenetration would launch it at enormous speed.
 -- ===========================================================================
 
+repeat task.wait() until game:IsLoaded()
+
+task.wait(1)
+
 if game.PlaceId ~= 142823291 then
     return
-end
-if not game:IsLoaded() then
-    game.Loaded:Wait()
 end
 
 local Players = game:GetService("Players")
