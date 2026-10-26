@@ -11,9 +11,11 @@
 --     signal, not a guess about names.
 --   * after a coin is taken the script waits COIN_DELAY before going for the
 --     next one, so the pace reads as a player, not a sweep.
---   * a 267 kick that got through anyway puts Roblox's own ErrorPrompt on the
---     screen; that prompt teleports straight into a fresh server, and its text
---     and the account name are posted to WEBHOOK_URL first.
+--   * hopping is one plain Teleport now. The public server list is gone: the
+--     timer, an empty server, a stalled round, the button and the ErrorPrompt
+--     all fire the same Teleport, and auto-execute brings the script back on
+--     the next server. The ErrorPrompt's text and the account name are posted
+--     to WEBHOOK_URL first.
 --
 --  Load-bearing, do not "clean up":
 --   * the character is moved by writing its CFrame. No physics actuator: a
@@ -50,7 +52,7 @@ local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 
 
 -- ============================== SETTINGS ==============================
-local TARGET_SPEED = 26        -- studs per second. 21 is the ceiling this
+local TARGET_SPEED = 26        -- studs per second. 26 is the ceiling this
                                -- script is tuned for: past it the step grows
                                -- faster than the game's own replication and
                                -- the practice stops being safe.
@@ -89,17 +91,15 @@ end
 local WEBHOOK_URL = webhookUrl()
 
 -- server hop
-local HOP_ENABLED          = true
-local HOP_AFTER            = 60 * 60
--- Not one coin taken since the script started by this point: the server is not
--- giving anything, so leave it instead of waiting out the full HOP_AFTER.
-local HOP_STALL_AFTER      = 60 * 10
-local HOP_MIN_PLAYERS      = 5
-local HOP_MAX_PLAYERS      = 8
-local HOP_PAGES            = 5
-local HOP_RETRY_DELAY      = 15
-local HOP_MAX_TRY_PER_PASS = 30
-local HOP_ALLOW_FALLBACK   = true
+local HOP_ENABLED     = true
+local HOP_AFTER       = 60 * 60
+-- Checked once, ten minutes after the script starts: no coin banked in the
+-- session by then means this server is not giving anything, so leave it instead
+-- of waiting out the full HOP_AFTER. With even one coin, the run is left alone
+-- until the hour is up.
+local HOP_STALL_AFTER = 60 * 10
+-- How long a teleport that did not take is waited out before firing it again.
+local HOP_RETRY_DELAY = 5
 -- no queue_on_teleport: the script lives in the executor's auto-execute folder,
 -- so it comes back on its own. Queueing it as well would run two copies.
 -- ======================================================================
@@ -130,10 +130,11 @@ local antiAfkConnection        = nil
 local characterAddedConnection = nil
 local deviceSelectThread       = nil
 local hopThread                = nil
+local hopRetryThread           = nil
 local errorPromptThread        = nil
 
 local farmTime   = 0
-local hopsDone   = 0
+local stallChecked = false
 local hopRunning = false
 
 local ScreenGui = nil
@@ -675,224 +676,29 @@ end
 
 
 -- ============================== SERVER HOP ==============================
---   * ask Roblox for the public server list of this place,
---   * keep the servers with a free slot, best match for the wanted size first,
---   * try them one by one; a teleport that does not throw can still fail (a full
---     server fires TeleportInitFailed instead of raising), so every attempt is
---     watched,
---   * and when a sweep finds nothing, start another one. It never gives up.
-local function hopLog(message)
-    print("[AutoFarm/hop] " .. tostring(message))
-end
-
-local function serverOrder(a, b)
-    if a.off ~= b.off then return a.off < b.off end
-    return a.playing > b.playing
-end
-
-local function fetchServers(cursor)
-    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true")
-        :format(game.PlaceId)
-    if cursor and cursor ~= "" and cursor ~= "null" then
-        url = url .. "&cursor=" .. cursor
-    end
-
-    local httpRequest = httpBackend()
-
-    local body
-    if httpRequest then
-        local ok, res = pcall(function()
-            return httpRequest({
-                Url = url,
-                Method = "GET",
-                Headers = { ["Accept"] = "application/json", ["User-Agent"] = "Mozilla/5.0" },
-            })
-        end)
-        if ok and res and res.Body then body = res.Body end
-    end
-    if not body then
-        local ok, res = pcall(function() return game:HttpGet(url) end)
-        if ok then body = res end
-    end
-    if not body then return nil, nil end
-
-    local ok, decoded = pcall(HttpService.JSONDecode, HttpService, body)
-    if not ok or type(decoded) ~= "table" or type(decoded.data) ~= "table" then
-        return nil, nil
-    end
-
-    -- Nothing is filtered out except servers we cannot join. The API is asked
-    -- newest-and-fullest first, which is the opposite of what a small-server
-    -- band wants: those sit far down the list, so a strict "keep only the band"
-    -- filter would throw away page after page. Instead each server carries how
-    -- far outside the band it sits (0 = inside it) and the list is sorted by
-    -- that, so the closest thing to what was asked for wins.
-    local servers = {}
-    for _, s in ipairs(decoded.data) do
-        if type(s) == "table" and s.id and s.id ~= game.JobId then
-            local playing = tonumber(s.playing) or 0
-            local maxPlayers = tonumber(s.maxPlayers) or 12
-            local free = maxPlayers - playing
-
-            if free >= 1 then
-                local off = 0
-                if playing < HOP_MIN_PLAYERS then
-                    off = HOP_MIN_PLAYERS - playing
-                elseif playing > HOP_MAX_PLAYERS then
-                    off = playing - HOP_MAX_PLAYERS
-                end
-
-                table.insert(servers, {
-                    id = s.id,
-                    playing = playing,
-                    free = free,
-                    off = off,
-                })
-            end
-        end
-    end
-
-    table.sort(servers, serverOrder)
-
-    local nextCursor = decoded.nextPageCursor
-    if nextCursor == "null" then nextCursor = nil end
-    return servers, nextCursor
-end
-
--- Tries one server. Returns true only if the teleport really left.
-local function tryTeleportTo(server)
-    local failed = false
-    local failResult = nil
-
-    local conn
-    conn = TeleportService.TeleportInitFailed:Connect(function(_, result)
-        failed = true
-        failResult = result
-    end)
-
-    local ok, err = pcall(function()
-        TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, player)
-    end)
-
-    if not ok then
-        if conn then conn:Disconnect() end
-        hopLog("Teleport error: " .. tostring(err))
-        return false
-    end
-
-    local startedAt = os.clock()
-    while not failed and (os.clock() - startedAt) < 3 do
-        task.wait(0.2)
-    end
-    if conn then conn:Disconnect() end
-
-    if not failed then return true end
-
-    hopLog("Teleport refused: " .. tostring(failResult))
-    return false
-end
-
-local function serverHop()
+-- The public server list is gone: no player counts, no pages, no per-server
+-- IDs. Every trigger fires the same plain Teleport. The client leaves, the
+-- script is torn down, and auto-execute runs it again on the next server; a
+-- teleport that does not take is simply fired again.
+--
+-- One way in for every hop, so the countdown starts over the same way whichever
+-- one fired it: the panel button, the timer, being alone, a stalled round, an
+-- error prompt. The reason is logged here, once, not by each caller.
+local function requestHop(reason)
     if hopRunning then return end
     hopRunning = true
-    hopsDone = hopsDone + 1
-
-    stopMovement()
-    hopLog(("Hop #%d: looking for a server with %d-%d players")
-        :format(hopsDone, HOP_MIN_PLAYERS, HOP_MAX_PLAYERS))
-
-    local round = 0
-    while isLoaded do
-        round = round + 1
-
-        -- servers already refused during this hop, so the same dead ones are not
-        -- tried twice in one pass. Kept in memory on purpose: a hop happens once
-        -- per HOP_AFTER, by which point those servers are long gone.
-        local seen = {}
-        local inBand = {}
-        local nearest = {}
-
-        -- The whole sweep is read BEFORE anything is tried. A server inside the
-        -- band can sit on page 2 while page 1 is full of servers outside it, and
-        -- trying page 1 first would mean settling for the wrong one while the
-        -- right one was two pages away.
-        local cursor = nil
-        for page = 1, HOP_PAGES do
-            if not isLoaded then break end
-
-            local servers, nextCursor = fetchServers(cursor)
-
-            if servers then
-                for _, server in ipairs(servers) do
-                    if not seen[server.id] then
-                        seen[server.id] = true
-                        if server.off == 0 then
-                            table.insert(inBand, server)
-                        else
-                            table.insert(nearest, server)
-                        end
-                    end
-                end
-            else
-                hopLog(("Page %d: nothing readable"):format(page))
-            end
-
-            if not nextCursor then break end
-            cursor = nextCursor
-            task.wait(0.6)   -- small pause between two API calls
-        end
-
-        table.sort(nearest, serverOrder)
-
-        if #inBand == 0 then
-            local best = nearest[1]
-            if best then
-                hopLog(("Pass %d: no server at %d-%d players; closest is %d")
-                    :format(round, HOP_MIN_PLAYERS, HOP_MAX_PLAYERS, best.playing))
-            else
-                hopLog(("Pass %d: no joinable server in the pages scanned"):format(round))
-            end
-        else
-            hopLog(("Pass %d: %d server(s) in the %d-%d band")
-                :format(round, #inBand, HOP_MIN_PLAYERS, HOP_MAX_PLAYERS))
-        end
-
-        local order = {}
-        for _, server in ipairs(inBand) do table.insert(order, server) end
-        if HOP_ALLOW_FALLBACK then
-            for _, server in ipairs(nearest) do table.insert(order, server) end
-        end
-
-        local tried = 0
-        for _, server in ipairs(order) do
-            if not isLoaded then break end
-            if tried >= HOP_MAX_TRY_PER_PASS then break end
-
-            tried = tried + 1
-            hopLog(("Try %d: %s (%d players, %d free)")
-                :format(tried, server.id, server.playing, server.free))
-
-            if tryTeleportTo(server) then
-                hopRunning = false
-                return
-            end
-
-            task.wait(0.5)
-        end
-
-        hopLog(("Pass %d finished (%d tried) -> new sweep"):format(round, tried))
-        task.wait(HOP_RETRY_DELAY)
-    end
-
-    hopRunning = false
-end
-
--- One way in for every hop, so the countdown starts over the same way whichever
--- one fired it: the panel button, the timer, being alone.
-local function requestHop()
-    if hopRunning then return end
     farmTime = 0
-    task.spawn(serverHop)
+    stopMovement()
+    print("[AutoFarm/hop] " .. (reason or "Teleporting to a new server"))
+
+    -- The same plain Teleport as the error path. A call that returns without
+    -- taking means the client is still here, so it is fired again.
+    hopRetryThread = task.spawn(function()
+        while isLoaded do
+            pcall(TeleportService.Teleport, TeleportService, game.PlaceId)
+            task.wait(HOP_RETRY_DELAY)
+        end
+    end)
 end
 
 -- Only counts while the farm is switched on, so the hour really is an hour of
@@ -905,8 +711,6 @@ local function startHopTimer()
         while isLoaded do
             task.wait(1)
             local now = os.clock()
-            -- only while the farm is running, so the hour really is an hour of
-            -- farming -- and so a pause cannot be mistaken for a stalled server
             if enabled then
                 farmTime = farmTime + (now - last)
             end
@@ -915,14 +719,15 @@ local function startHopTimer()
             if HOP_ENABLED and enabled then
                 if farmTime >= HOP_AFTER then
                     requestHop()
-                -- A whole HOP_STALL_AFTER with no coin taken at all: nothing is
-                -- being farmed here, so try another server. Fires once per
-                -- HOP_STALL_AFTER at most -- requestHop resets farmTime -- and
-                -- never again once a single coin has been banked this session.
-                elseif coinsCollected == 0 and farmTime >= HOP_STALL_AFTER then
-                    hopLog(("No coin taken in %d min -> hopping out")
-                        :format(math.floor(HOP_STALL_AFTER / 60)))
-                    requestHop()
+                -- One look ten minutes in, never again: with nothing banked in
+                -- the session this server is not paying, so hop out. A single
+                -- coin and the run stays until the hour is up.
+                elseif not stallChecked and farmTime >= HOP_STALL_AFTER then
+                    stallChecked = true
+                    if coinsCollected == 0 then
+                        requestHop(("No coin taken in %d min -> hopping out")
+                            :format(math.floor(HOP_STALL_AFTER / 60)))
+                    end
                 end
             end
         end
@@ -935,8 +740,7 @@ local function startAloneWatch()
         while isLoaded do
             task.wait(10)
             if HOP_ENABLED and enabled and #Players:GetPlayers() <= 1 then
-                hopLog("Alone in this server -> hopping out")
-                requestHop()
+                requestHop("Alone in this server -> hopping out")
             end
         end
     end)
@@ -996,12 +800,8 @@ local function startErrorPromptWatch()
                 if not errorNotified then
                     errorNotified = true
                     notifyError(prompt)
+                    requestHop("Error prompt on screen -> teleporting to a new server")
                 end
-                hopLog("Error prompt on screen -> teleporting to a new server")
-                pcall(function()
-                    TeleportService:Teleport(game.PlaceId)
-                end)
-                task.wait(5)   -- let the client leave before trying again
             else
                 errorNotified = false
             end
@@ -1113,9 +913,12 @@ local function unloadScript()
     if deviceSelectThread then task.cancel(deviceSelectThread) end
     if hopThread then task.cancel(hopThread) end
     if errorPromptThread then task.cancel(errorPromptThread) end
+    if hopRetryThread then task.cancel(hopRetryThread) end
     deviceSelectThread = nil
     hopThread = nil
     errorPromptThread = nil
+    hopRetryThread = nil
+    hopRunning = false
 
     antiAfkConnection = dropConnection(antiAfkConnection)
     characterAddedConnection = dropConnection(characterAddedConnection)
@@ -1128,6 +931,7 @@ local function loadScript()
     bindCharacter()
 
     coinsCollected = 0
+    stallChecked = false
 
     startMovementEngine()
     startDeviceSelectDismisser()
@@ -1181,9 +985,13 @@ ScreenGui.Parent = player:WaitForChild("PlayerGui")
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.DisplayOrder = 2147483647   -- over every other interface
 
+local PANEL_W, PANEL_H, PANEL_MARGIN = 272, 356, 24
+
 Main = Instance.new("Frame")
-Main.Size = UDim2.new(0, 272, 0, 356)
-Main.Position = UDim2.new(0.5, -136, 0.5, -178)
+Main.Size = UDim2.new(0, PANEL_W, 0, PANEL_H)
+-- Parked on the right, not centred: the device-select prompt's tablet button
+-- has to stay clickable while the panel is up.
+Main.Position = UDim2.new(1, -(PANEL_W + PANEL_MARGIN), 0.5, -PANEL_H / 2)
 Main.BackgroundColor3 = C_BG
 Main.BorderSizePixel = 0
 Main.Active = true        -- so the panel takes touch input on its own
@@ -1401,7 +1209,7 @@ end)
 divider(184)
 
 -- the description line of this row is taken over by the countdown
-local hopDesc = createRow(185, "Server hop", "Every 60 min", HOP_ENABLED, function(state)
+local hopDesc = createRow(185, "Server hop", "", HOP_ENABLED, function(state)
     HOP_ENABLED = state
     if state then farmTime = 0 end
 end)
@@ -1437,7 +1245,9 @@ end)
 HopBtn.MouseLeave:Connect(function()
     TweenService:Create(HopBtn, TweenInfo.new(0.12), {BackgroundTransparency = 0.35}):Play()
 end)
-HopBtn.MouseButton1Click:Connect(requestHop)
+HopBtn.MouseButton1Click:Connect(function()
+    requestHop("Hop now")
+end)
 
 divider(263)
 
@@ -1596,7 +1406,7 @@ task.spawn(function()
         if not HOP_ENABLED then
             hopDesc.Text = "Off"
         elseif hopRunning then
-            hopDesc.Text = "Looking for a smaller server"
+            hopDesc.Text = "Teleporting to a new server"
         elseif not enabled then
             hopDesc.Text = string.format("Paused · %d min", math.floor(farmTime / 60))
         else
