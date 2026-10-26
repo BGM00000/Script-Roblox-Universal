@@ -626,23 +626,24 @@ local function panelCovers(x, y)
         and y >= position.Y and y <= position.Y + size.Y
 end
 
-local function clickGuiButton(button)
+-- A few tries with firesignal before touching the input system: it is the
+-- cleaner of the two and needs no hit-testing.
+local CLICK_FALLBACK_AFTER = 3
+
+local function clickGuiButton(button, attempt)
     if not button or not button.Parent then return end
 
-    -- Method 1: fire the events the prompt listens to. This does not go through
-    -- hit-testing, so it works with a panel in the way.
-    pcall(function()
-        if button:IsA("GuiButton") then
-            button.MouseButton1Down:Fire(0, 0)
-            button.MouseButton1Up:Fire(0, 0)
-            button.MouseButton1Click:Fire()
-        end
-    end)
+    -- Method 1: firesignal from the executor. It reaches the prompt's own
+    -- connections directly, so a panel in the way changes nothing.
+    if attempt <= CLICK_FALLBACK_AFTER and type(firesignal) == "function" then
+        pcall(firesignal, button.MouseButton1Click)
+        return
+    end
 
-    -- Method 2: a real click, in case the prompt does not listen to the events
-    -- above. It goes through the input system, so the game sees it exactly as if
-    -- it had been pressed. The panel is hidden for the instant it takes if it is
-    -- in the way.
+    -- Method 2: a real click, for the case where firesignal left the prompt up.
+    -- It goes through the input system, so the game sees it exactly as if it had
+    -- been pressed. The panel is hidden for the instant it takes if it is in
+    -- the way.
     pcall(function()
         local center = button.AbsolutePosition + (button.AbsoluteSize * 0.5)
         local virtualInput = game:GetService("VirtualInputManager")
@@ -665,9 +666,15 @@ local function startDeviceSelectDismisser()
     if deviceSelectThread then return end
 
     deviceSelectThread = task.spawn(function()
+        local attempt = 0
         while isLoaded do
             local button = findDeviceSelectButton()
-            if button then clickGuiButton(button) end
+            if button then
+                attempt = attempt + 1
+                clickGuiButton(button, attempt)
+            else
+                attempt = 0
+            end
             task.wait(1)
         end
         deviceSelectThread = nil
