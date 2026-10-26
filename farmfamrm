@@ -90,7 +90,7 @@ local WEBHOOK_URL = webhookUrl()
 
 -- server hop
 local HOP_ENABLED          = true
-local HOP_AFTER            = 60 * 40
+local HOP_AFTER            = 60 * 60
 -- Not one coin taken since the script started by this point: the server is not
 -- giving anything, so leave it instead of waiting out the full HOP_AFTER.
 local HOP_STALL_AFTER      = 60 * 10
