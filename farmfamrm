@@ -50,7 +50,7 @@ local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 
 
 -- ============================== SETTINGS ==============================
-local TARGET_SPEED = 27        -- studs per second. 21 is the ceiling this
+local TARGET_SPEED = 26        -- studs per second. 21 is the ceiling this
                                -- script is tuned for: past it the step grows
                                -- faster than the game's own replication and
                                -- the practice stops being safe.
