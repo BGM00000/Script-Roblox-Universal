@@ -130,6 +130,7 @@ local roundEndConnections      = {}
 local antiAfkConnection        = nil
 local characterAddedConnection = nil
 local deviceSelectThread       = nil
+local prestigeThread           = nil
 local hopThread                = nil
 local hopRetryThread           = nil
 local errorPromptThread        = nil
@@ -683,6 +684,33 @@ local function startDeviceSelectDismisser()
 end
 
 
+-- ============================== PRESTIGE ==============================
+-- One answer, ten seconds after the script starts: by then the game's own
+-- interface is up and the button is there. Deliberately not a loop -- a second
+-- answer in the same session does nothing.
+local PRESTIGE_PATH = { "MainGUI", "Game", "Prestige", "Accept" }
+local PRESTIGE_DELAY = 10
+
+local function startPrestigeAccept()
+    if prestigeThread then return end
+
+    prestigeThread = task.spawn(function()
+        task.wait(PRESTIGE_DELAY)
+
+        local node = player:FindFirstChild("PlayerGui")
+        for _, name in ipairs(PRESTIGE_PATH) do
+            node = node and node:WaitForChild(name, 5)
+        end
+        prestigeThread = nil
+        if not node or type(firesignal) ~= "function" then return end
+
+        pcall(firesignal, node.MouseButton1Click)
+        pcall(firesignal, node.Activated)
+        print("[AutoFarm/prestige] Accept fired")
+    end)
+end
+
+
 -- ============================== SERVER HOP ==============================
 -- The public server list is gone: no player counts, no pages, no per-server
 -- IDs. Every trigger fires the same plain Teleport. The client leaves, the
@@ -919,10 +947,12 @@ local function unloadScript()
     -- these loops would stop on their own (isLoaded is already false), but
     -- cancelling releases them now and leaves no stale handle for the next load
     if deviceSelectThread then task.cancel(deviceSelectThread) end
+    if prestigeThread then task.cancel(prestigeThread) end
     if hopThread then task.cancel(hopThread) end
     if errorPromptThread then task.cancel(errorPromptThread) end
     if hopRetryThread then task.cancel(hopRetryThread) end
     deviceSelectThread = nil
+    prestigeThread = nil
     hopThread = nil
     errorPromptThread = nil
     hopRetryThread = nil
@@ -943,6 +973,7 @@ local function loadScript()
 
     startMovementEngine()
     startDeviceSelectDismisser()
+    startPrestigeAccept()
     startHopTimer()
     startAloneWatch()
     startErrorPromptWatch()
