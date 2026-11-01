@@ -53,7 +53,7 @@ local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 
 
 -- ============================== SETTINGS ==============================
-local TARGET_SPEED = 24        -- studs per second. 26 is the ceiling this
+local TARGET_SPEED = 25        -- studs per second. 26 is the ceiling this
                                -- script is tuned for: past it the step grows
                                -- faster than the game's own replication and
                                -- the practice stops being safe.
@@ -93,7 +93,7 @@ local WEBHOOK_URL = webhookUrl()
 
 -- server hop
 local HOP_ENABLED     = true
-local HOP_AFTER       = 60 * 120
+local HOP_AFTER       = 60 * 300
 -- Checked once, ten minutes after the script starts: no coin banked in the
 -- session by then means this server is not giving anything, so leave it instead
 -- of waiting out the full HOP_AFTER. With even one coin, the run is left alone
