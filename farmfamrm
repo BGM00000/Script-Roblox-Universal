@@ -55,7 +55,7 @@ local gameplayRemotes = remotes and remotes:WaitForChild("Gameplay", 5)
 SoundService:SetSoundEnabled(false)
 
 -- ============================== SETTINGS ==============================
-local TARGET_SPEED = 23.5        -- studs per second. 23 is the ceiling this
+local TARGET_SPEED = 24        -- studs per second. 23 is the ceiling this
                                -- script is tuned for: past it the step grows
                                -- faster than the game's own replication and
                                -- the practice stops being safe.
@@ -65,7 +65,7 @@ local MAX_DIST     = 1000       -- radius of the search. An MM2 map fits inside
 
 -- Seconds spent on a coin before going for the next one: the pause that keeps
 -- the pace from reading as a sweep.
-local COIN_DELAY = 0.25
+local COIN_DELAY = 0.2
 
 -- Where the coins live. Structure, not a guess: the active map holds a
 -- CoinContainer, each coin under it carries a CoinVisual.
@@ -95,7 +95,7 @@ local WEBHOOK_URL = webhookUrl()
 
 -- server hop
 local HOP_ENABLED     = true
-local HOP_AFTER       = 60 * 200
+local HOP_AFTER       = 60 * 90
 -- Checked once, ten minutes after the script starts: no coin banked in the
 -- session by then means this server is not giving anything, so leave it instead
 -- of waiting out the full HOP_AFTER. With even one coin, the run is left alone
